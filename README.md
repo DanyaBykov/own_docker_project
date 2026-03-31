@@ -50,3 +50,4 @@ We will have three main parts:
 
 ## 3. What have we already done
 
+We have done a simple container that uses alpine-minirootfs as an rootfs image, namespaces and Cgroups for isolation and resource limitation. It still needs a lot of work on security, but it is a solid base
