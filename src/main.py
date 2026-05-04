@@ -73,6 +73,15 @@ def _setup_networking_inner(pid, port_mappings, cleanup_cmds):
     run_command(nat_rule)
     cleanup_cmds.append(nat_rule.replace("-A", "-D"))
 
+    # MASQUERADE traffic going into the container so its responses route back via
+    # veth_host rather than trying to reach 127.0.0.1 through a non-loopback path.
+    run_command("iptables -t nat -A POSTROUTING -d 172.18.0.0/24 -j MASQUERADE")
+    cleanup_cmds.append("iptables -t nat -D POSTROUTING -d 172.18.0.0/24 -j MASQUERADE")
+
+    # Allow the kernel to route loopback-addressed packets through veth interfaces.
+    run_command("sysctl -w net.ipv4.conf.all.route_localnet=1")
+    cleanup_cmds.append("sysctl -w net.ipv4.conf.all.route_localnet=0")
+
     # Allow return traffic for established connections
     run_command("iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT")
     cleanup_cmds.append("iptables -D FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT")
@@ -85,16 +94,19 @@ def _setup_networking_inner(pid, port_mappings, cleanup_cmds):
 
     for mapping in port_mappings:
         host_port, container_port = mapping.split(":")
-        dnat_rule = f"iptables -t nat -A PREROUTING -p tcp --dport {host_port} -j DNAT --to-destination 172.18.0.2:{container_port}"
-        run_command(dnat_rule)
-        cleanup_cmds.append(dnat_rule.replace("-A", "-D"))
-        # Allow FORWARD traffic for this mapped port (both TCP and UDP)
-        fwd_tcp = f"iptables -A FORWARD -s 172.18.0.0/24 -p tcp --dport {container_port} -j ACCEPT"
-        fwd_udp = f"iptables -A FORWARD -s 172.18.0.0/24 -p udp --dport {container_port} -j ACCEPT"
-        run_command(fwd_tcp)
-        run_command(fwd_udp)
-        cleanup_cmds.append(fwd_tcp.replace("-A", "-D"))
-        cleanup_cmds.append(fwd_udp.replace("-A", "-D"))
+        for proto in ("tcp", "udp"):
+            # PREROUTING: packets arriving on a real interface
+            dnat_pre = f"iptables -t nat -A PREROUTING -p {proto} --dport {host_port} -j DNAT --to-destination 172.18.0.2:{container_port}"
+            run_command(dnat_pre)
+            cleanup_cmds.append(dnat_pre.replace("-A", "-D"))
+            # OUTPUT: packets from localhost connecting to localhost:host_port
+            dnat_out = f"iptables -t nat -A OUTPUT -p {proto} -d 127.0.0.1 --dport {host_port} -j DNAT --to-destination 172.18.0.2:{container_port}"
+            run_command(dnat_out)
+            cleanup_cmds.append(dnat_out.replace("-A", "-D"))
+            # FORWARD inbound: traffic arriving at the container after DNAT
+            fwd_in = f"iptables -A FORWARD -d 172.18.0.0/24 -p {proto} --dport {container_port} -j ACCEPT"
+            run_command(fwd_in)
+            cleanup_cmds.append(fwd_in.replace("-A", "-D"))
 
     # Drop all other outbound traffic from the container
     run_command("iptables -A FORWARD -s 172.18.0.0/24 -j DROP")
@@ -250,6 +262,9 @@ def run_container(rootfs_path, command_args, memory_limit_mb, cpu_limit_percenta
         # (ip, iptables, sysctl) stay in the host namespaces and can see the
         # child's PID when setting up the veth pair.
         os.unshare(os.CLONE_NEWUTS | os.CLONE_NEWNS)
+        # Prevent mount events from propagating back to the host namespace.
+        # Without this, mounts inside the container leak into the host's /dev.
+        os.system("mount --make-rprivate /")
         socket.sethostname("sandbox")
         os.chdir(rootfs_path)
         os.chroot(".")

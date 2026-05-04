@@ -15,9 +15,9 @@ echo "Done!"
 echo "Preparing DNS for package installation..."
 cp /etc/resolv.conf rootfs/etc/resolv.conf
 
-# Alpine 3.18 ships Minetest (renamed to Luanti in Oct 2024 — update if upgrading Alpine)
+# minetest-server: headless server binary; minetest-mineclone2: the only game in Alpine 3.18 repos
 echo "Installing Minetest server..."
-chroot rootfs /bin/sh -c "apk update && apk add minetest"
+chroot rootfs /bin/sh -c "apk update && apk add minetest-server minetest-mineclone2"
 
 echo "Creating world directory and server config..."
 mkdir -p rootfs/var/luanti/world
@@ -26,6 +26,7 @@ cat > rootfs/etc/luanti.conf << 'EOF'
 port = 30000
 bind_address = 0.0.0.0
 world_path = /var/luanti/world
+default_game = mineclone2
 enable_damage = false
 creative_mode = false
 server_name = Modbox Demo
