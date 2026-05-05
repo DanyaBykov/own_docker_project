@@ -113,6 +113,30 @@ Spawned child 2: PID ...
 Fork blocked after N children — pids.max is working
 ```
 
+### Security Test
+
+To run a comprehensive security test of the container's isolation:
+
+1. **Set up the host flag** (that the malicious mode will try to get):
+   ```bash
+   echo "HOST_FLAG" | sudo tee /tmp/flag.txt
+   ```
+
+2. **Run the test**:
+   ```bash
+   sudo python3 src/main.py python3 /src/security_test.py
+   ```
+
+Expected output:
+- `Filesystem Isolation` should be `[CONTAINED]`
+- `Privilege Escalation` should be `[CONTAINED]`
+- `Syscall Jailbreak` should be `[CONTAINED]`
+- `Network Leak` should be `[CONTAINED]`
+- `Resource: Memory Limit` should be `[CONTAINED]`
+- `Resource: PID Limit` should be `[CONTAINED]`
+
+If any of these show `[ESCAPED]`, the sandbox has a vulnerability!
+
 ### Network egress filtering
 
 While the demo is running, in a second terminal try to reach the internet from inside the container:

@@ -1,6 +1,27 @@
 # Modbox: Our own engine for containerization based on Namespaces and Cgroups
 **Authors:** [Danylo Bykov](https://github.com/DanyaBykov), [Ivan Shevchuk](https://github.com/DoktorTomato)
 
+## Usage
+
+To run a command inside the Modbox container:
+
+```bash
+sudo python src/main.py [options] <command> [args...]
+```
+
+### Examples
+
+```bash
+# Run a shell with default limits
+sudo python src/main.py /bin/sh
+
+# Run a command with a 256MB memory limit
+sudo python src/main.py --memory-limit 256 ls -la /
+
+# Run a command with a 10% CPU limit and 16 max processes
+sudo python src/main.py --cpu-limit 0.1 --pid-limit 16 echo "Hello"
+```
+
 ## 1. Practical understanding of theme/problem
 
 ### 1.а. Where can we use this?
@@ -30,7 +51,7 @@ In an ideal environment, this would be a comprehensive rootless orchestration sy
 4. A convenient web panel or other form of UI to monitor sandbox exit attempts.
 
 ### 2.б. How do we do it in our project
-For this project we develop C++ wrapper, that acts as a launcher for the process (for example our game server or game session). 
+For this project we develop a Python script, that acts as a launcher for the process (for example our game server or game session). 
 
 We will have three main parts:
 1. Isolation (using Namespaces)
