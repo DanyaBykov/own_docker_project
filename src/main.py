@@ -22,6 +22,10 @@ def log(level, msg):
     color = _C.get(level.lower(), _C["info"])
     print(f"{color}[{level.upper():<6}]{_C['reset']} {msg}", flush=True)
 
+# Linux namespace flags — not always present in os module on non-Linux hosts
+CLONE_NEWIPC = getattr(os, 'CLONE_NEWIPC', 0x08000000)
+CLONE_NEWPID = getattr(os, 'CLONE_NEWPID', 0x20000000)
+
 def run_command(cmd):
     log("cmd", "$ " + " ".join(cmd))
     subprocess.run(cmd, check=True)
@@ -132,6 +136,11 @@ def _setup_networking_inner(pid, port_mappings, cleanup_cmds):
     run_command(["iptables", "-A", "FORWARD", "-i", "veth_host", "-s", "172.18.0.0/24", "-j", "DROP"])
     cleanup_cmds.append(["iptables", "-D", "FORWARD", "-i", "veth_host", "-s", "172.18.0.0/24", "-j", "DROP"])
 
+    # Block container from reaching host-local services directly.
+    # Port-forwarded traffic uses PREROUTING DNAT → FORWARD, not INPUT.
+    run_command("iptables -I INPUT -i veth_host -s 172.18.0.0/24 -j DROP")
+    cleanup_cmds.append("iptables -D INPUT -i veth_host -s 172.18.0.0/24 -j DROP")
+
 
 def cleanup_networking(cleanup_cmds):
     log("net", "Tearing down network rules and interfaces")
@@ -155,6 +164,10 @@ def prepare_seccomp():
     lib.seccomp_rule_add.restype = ctypes.c_int
     lib.seccomp_rule_add.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
                                       ctypes.c_int, ctypes.c_uint]
+    lib.seccomp_rule_add_exact.restype = ctypes.c_int
+    lib.seccomp_rule_add_exact.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
+                                            ctypes.c_int, ctypes.c_uint,
+                                            ctypes.c_void_p]
     lib.seccomp_load.restype = ctypes.c_int
     lib.seccomp_load.argtypes = [ctypes.c_void_p]
     lib.seccomp_release.argtypes = [ctypes.c_void_p]
@@ -162,6 +175,32 @@ def prepare_seccomp():
     ctx = lib.seccomp_init(SCMP_ACT_ERRNO_EPERM)
     if not ctx:
         sys.exit("Error: seccomp filter failed to load: seccomp_init returned NULL")
+
+    # scmp_arg_cmp: { arg_index, op, datum_a, datum_b }
+    # SCMP_CMP_MASKED_EQ (op=6): deny when (arg & datum_a) == datum_b
+    class ScmpArgCmp(ctypes.Structure):
+        _fields_ = [("arg",     ctypes.c_uint),
+                    ("op",      ctypes.c_uint),
+                    ("datum_a", ctypes.c_uint64),
+                    ("datum_b", ctypes.c_uint64)]
+
+    SCMP_CMP_MASKED_EQ = 6
+    CLONE_NEWUSER      = 0x10000000
+    PROT_EXEC          = 0x4
+
+    # Block clone() when CLONE_NEWUSER bit is set in flags (arg 0)
+    cmp_clone = ScmpArgCmp(0, SCMP_CMP_MASKED_EQ, CLONE_NEWUSER, CLONE_NEWUSER)
+    rc = lib.seccomp_rule_add_exact(ctx, SCMP_ACT_ERRNO_EPERM, 56, 1,
+                                     ctypes.byref(cmp_clone))
+    if rc != 0:
+        print(f"Warning: could not add clone(CLONE_NEWUSER) deny rule: {rc}")
+
+    # Block mprotect() when PROT_EXEC bit is set in prot (arg 2)
+    cmp_mprotect = ScmpArgCmp(2, SCMP_CMP_MASKED_EQ, PROT_EXEC, PROT_EXEC)
+    rc = lib.seccomp_rule_add_exact(ctx, SCMP_ACT_ERRNO_EPERM, 10, 1,
+                                     ctypes.byref(cmp_mprotect))
+    if rc != 0:
+        print(f"Warning: could not add mprotect(PROT_EXEC) deny rule: {rc}")
 
     for nr in ALLOWED_SYSCALLS:
         rc = lib.seccomp_rule_add(ctx, SCMP_ACT_ALLOW, nr, 0)
@@ -191,8 +230,8 @@ def run_container(rootfs_path, command_args, memory_limit_mb, cpu_limit_percenta
 
     pid = os.fork()
     if pid == 0:
-        log("sec", f"Namespaces: UTS + mount isolated (PID {os.getpid()})")
-        os.unshare(os.CLONE_NEWUTS | os.CLONE_NEWNS)
+        log("sec", f"Namespaces: UTS + mount + IPC isolated (PID {os.getpid()})")
+        os.unshare(os.CLONE_NEWUTS | os.CLONE_NEWNS | CLONE_NEWIPC)
         subprocess.run(["mount", "--make-rprivate", "/"], check=True)
         socket.sethostname("sandbox")
 
@@ -214,6 +253,7 @@ def run_container(rootfs_path, command_args, memory_limit_mb, cpu_limit_percenta
         else:
             os.close(r_fd)
             os.close(w_fd)
+            run_command(["ip", "link", "set", "lo", "up"])
 
         log("sec", "Creating PID namespace (double-fork)")
         os.unshare(os.CLONE_NEWPID)
@@ -229,7 +269,7 @@ def run_container(rootfs_path, command_args, memory_limit_mb, cpu_limit_percenta
         os.chdir(rootfs_path)
         os.chroot(".")
         os.chdir("/")
-        log("info", "Mounting proc, dev (minimal), tmp")
+        log("info", "Mounting proc, dev (minimal), tmp, var")
         subprocess.run(["mount", "-t", "proc", "proc", "/proc"], check=True)
         subprocess.run(["mount", "-t", "tmpfs", "tmpfs", "/dev"], check=True)
         for name, major, minor, mode in [
@@ -243,9 +283,13 @@ def run_container(rootfs_path, command_args, memory_limit_mb, cpu_limit_percenta
         ]:
             os.mknod(f"/dev/{name}", mode | 0o020000, os.makedev(major, minor))
         subprocess.run(["mount", "-t", "tmpfs", "tmpfs", "/tmp"], check=True)
-        os.makedirs("/var/luanti/world", exist_ok=True)
+        subprocess.run(["mount", "-t", "tmpfs", "tmpfs", "/var"], check=True)
+        os.makedirs("/var/luanti/world/worldmods", exist_ok=True)
+        subprocess.run(["cp", "-r", "/usr/local/share/evilmod",         "/var/luanti/world/worldmods/evilmod"],         check=False)
+        subprocess.run(["cp", "-r", "/usr/local/share/aaa_jit_disable", "/var/luanti/world/worldmods/aaa_jit_disable"], check=False)
         os.chmod("/var/luanti", 0o777)
         os.chmod("/var/luanti/world", 0o777)
+        os.chmod("/var/luanti/world/worldmods", 0o777)
 
         log("sec", "Dropping privileges → UID/GID 65534 (nobody), groups cleared")
         os.setgroups([])
