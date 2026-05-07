@@ -22,4 +22,4 @@ python3 src/main.py \
     --cpu-limit 0.8 \
     --pid-limit 64 \
     --port 30000:30000 \
-    minetestserver --config /etc/luanti.conf
+    minetestserver --config /etc/luanti.conf --world /var/luanti/world

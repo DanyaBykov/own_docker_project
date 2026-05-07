@@ -272,9 +272,6 @@ def run_container(rootfs_path, command_args, memory_limit_mb, cpu_limit_percenta
         os.system("mount -t proc proc /proc")
         os.system("mount -t devtmpfs devtmpfs /dev")
         os.system("mount -t tmpfs tmpfs /tmp")
-        os.system("mount -t tmpfs tmpfs /var")
-        # Create world and home dirs in the fresh /var and /tmp tmpfs while
-        # still root, then open them to writes by the unprivileged process.
         os.system("mkdir -p /var/luanti/world")
         os.system("chmod 777 /var/luanti /var/luanti/world")
         
