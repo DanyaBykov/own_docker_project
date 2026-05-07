@@ -309,7 +309,13 @@ def run_container(rootfs_path, command_args, memory_limit_mb, cpu_limit_percenta
 
             setup_cgroups(pid, memory_limit_mb, cpu_limit_percentage, pid_limit)
 
-            os.waitpid(pid, 0)
+            _, status = os.waitpid(pid, 0)
+            if os.WIFSIGNALED(status):
+                sig = os.WTERMSIG(status)
+                label = "OOM kill" if sig == 9 else f"signal {sig}"
+                print(f"Container process killed by {label}.")
+            elif os.WIFEXITED(status) and os.WEXITSTATUS(status) != 0:
+                print(f"Container process exited with code {os.WEXITSTATUS(status)}.")
         finally:
             if network_enabled:
                 cleanup_networking(cleanup_cmds)
