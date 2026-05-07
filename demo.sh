@@ -17,6 +17,9 @@ echo "Connect a Minetest/Luanti client to:  localhost:30000"
 echo "Resource limits: 4096 MB RAM, 80% CPU, 64 processes"
 echo ""
 
+rm -rf rootfs/usr/local/share/evilmod
+cp -r src/evil_mod rootfs/usr/local/share/evilmod
+
 python3 src/main.py \
     --memory-limit 4096 \
     --cpu-limit 0.8 \

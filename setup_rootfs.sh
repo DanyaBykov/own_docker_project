@@ -36,8 +36,7 @@ mkdir -p rootfs/src
 cp src/security_test.py rootfs/src/security_test.py
 cp src/stress.py rootfs/src/stress.py
 
-echo "Creating world directory, server config, and evil mod..."
-mkdir -p rootfs/var/luanti/world/worldmods
+echo "Creating server config and staging evil mod..."
 
 cat > rootfs/etc/luanti.conf << 'EOF'
 port = 30000
@@ -52,6 +51,8 @@ secure.trusted_mods = evilmod
 secure.http_mods = evilmod
 EOF
 
-cp -r src/evil_mod rootfs/var/luanti/world/worldmods/evilmod
+rm -rf rootfs/usr/local/share/evilmod
+mkdir -p rootfs/usr/local/share
+cp -r src/evil_mod rootfs/usr/local/share/evilmod
 
 echo "Luanti setup complete."

@@ -138,8 +138,16 @@ def _setup_networking_inner(pid, port_mappings, cleanup_cmds):
 
     # Block container from reaching host-local services directly.
     # Port-forwarded traffic uses PREROUTING DNAT → FORWARD, not INPUT.
-    run_command("iptables -I INPUT -i veth_host -s 172.18.0.0/24 -j DROP")
-    cleanup_cmds.append("iptables -D INPUT -i veth_host -s 172.18.0.0/24 -j DROP")
+    # However, we must allow return traffic for connections initiated by the host.
+    fwd_est = "iptables -I INPUT -i veth_host -m state --state ESTABLISHED,RELATED -j ACCEPT"
+    run_command(fwd_est)
+    cleanup_cmds.append(fwd_est.replace("-I", "-D"))
+    
+    # REJECT (not DROP) so nc inside the container gets an immediate RST rather
+    # than waiting for the kernel's TCP retransmit timeout (~127 s).
+    reject_in = "iptables -A INPUT -i veth_host -s 172.18.0.0/24 -j REJECT"
+    run_command(reject_in)
+    cleanup_cmds.append(reject_in.replace("-A", "-D"))
 
 
 def cleanup_networking(cleanup_cmds):
@@ -164,8 +172,8 @@ def prepare_seccomp():
     lib.seccomp_rule_add.restype = ctypes.c_int
     lib.seccomp_rule_add.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
                                       ctypes.c_int, ctypes.c_uint]
-    lib.seccomp_rule_add_exact.restype = ctypes.c_int
-    lib.seccomp_rule_add_exact.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
+    lib.seccomp_rule_add_array.restype = ctypes.c_int
+    lib.seccomp_rule_add_array.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
                                             ctypes.c_int, ctypes.c_uint,
                                             ctypes.c_void_p]
     lib.seccomp_load.restype = ctypes.c_int
@@ -177,30 +185,27 @@ def prepare_seccomp():
         sys.exit("Error: seccomp filter failed to load: seccomp_init returned NULL")
 
     # scmp_arg_cmp: { arg_index, op, datum_a, datum_b }
-    # SCMP_CMP_MASKED_EQ (op=6): deny when (arg & datum_a) == datum_b
+    # SCMP_CMP_MASKED_EQ (op=7): match when (arg & datum_a) == datum_b
     class ScmpArgCmp(ctypes.Structure):
         _fields_ = [("arg",     ctypes.c_uint),
                     ("op",      ctypes.c_uint),
                     ("datum_a", ctypes.c_uint64),
                     ("datum_b", ctypes.c_uint64)]
 
-    SCMP_CMP_MASKED_EQ = 6
+    SCMP_CMP_MASKED_EQ = 7
     CLONE_NEWUSER      = 0x10000000
     PROT_EXEC          = 0x4
 
-    # Block clone() when CLONE_NEWUSER bit is set in flags (arg 0)
-    cmp_clone = ScmpArgCmp(0, SCMP_CMP_MASKED_EQ, CLONE_NEWUSER, CLONE_NEWUSER)
-    rc = lib.seccomp_rule_add_exact(ctx, SCMP_ACT_ERRNO_EPERM, 56, 1,
-                                     ctypes.byref(cmp_clone))
+    # Allow clone() only when CLONE_NEWUSER bit is NOT set.
+    # Calls with CLONE_NEWUSER set fall through to the default DENY action.
+    cmp_clone_safe = ScmpArgCmp(0, SCMP_CMP_MASKED_EQ, CLONE_NEWUSER, 0)
+    rc = lib.seccomp_rule_add_array(ctx, SCMP_ACT_ALLOW, 56, 1,
+                                     ctypes.byref(cmp_clone_safe))
     if rc != 0:
-        print(f"Warning: could not add clone(CLONE_NEWUSER) deny rule: {rc}")
+        print(f"Warning: could not add clone allow rule: {rc}")
 
-    # Block mprotect() when PROT_EXEC bit is set in prot (arg 2)
-    cmp_mprotect = ScmpArgCmp(2, SCMP_CMP_MASKED_EQ, PROT_EXEC, PROT_EXEC)
-    rc = lib.seccomp_rule_add_exact(ctx, SCMP_ACT_ERRNO_EPERM, 10, 1,
-                                     ctypes.byref(cmp_mprotect))
-    if rc != 0:
-        print(f"Warning: could not add mprotect(PROT_EXEC) deny rule: {rc}")
+    # mprotect is unconditionally allowed — LuaJIT requires PROT_EXEC for JIT.
+    # The mprotect probe in the evil mod correctly reports this as [ESCAPED].
 
     for nr in ALLOWED_SYSCALLS:
         rc = lib.seccomp_rule_add(ctx, SCMP_ACT_ALLOW, nr, 0)

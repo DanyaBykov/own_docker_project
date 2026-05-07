@@ -1,15 +1,25 @@
+minetest.log("action", "[EVILMOD] Initializing...")
+
 local IE = minetest.request_insecure_environment()
 if not IE then
     minetest.log("error", "[EVILMOD] insecure env unavailable — add evilmod to secure.trusted_mods")
     return
 end
 
-local ffi_ok, ffi = pcall(require, "ffi")
-
 local function probe(name, fn)
     local ok, result = pcall(fn)
     local line = ok and result or ("[LUA ERROR] " .. tostring(result))
     minetest.log("action", string.format("[EVILMOD] %-50s %s", name, line))
+end
+
+-- Run a shell command via IE.io.popen; returns stdout or nil on failure.
+local function popen(cmd)
+    if not IE.io.popen then return nil end
+    local f = IE.io.popen(cmd, "r")
+    if not f then return nil end
+    local out = f:read("*a")
+    f:close()
+    return out
 end
 
 minetest.after(3, function()
@@ -21,19 +31,26 @@ minetest.after(3, function()
         if not f then return "[CONTAINED] cannot open /proc/1/comm" end
         local comm = f:read("*a"):gsub("%s+", "")
         f:close()
+        if comm == "minetestserver" or comm == "minetest" then
+            return string.format("[CONTAINED] PID 1 is '%s' (container init, not host)", comm)
+        end
         return string.format("[ESCAPED] PID 1 on host is '%s'", comm)
     end)
 
-    probe("PID ns — total host PIDs via /proc/loadavg", function()
-        local f = IE.io.open("/proc/loadavg", "r")
-        if not f then return "[CONTAINED] cannot read /proc/loadavg" end
-        local line = f:read("*a")
+    probe("PID ns — visible PID count in /proc", function()
+        -- Count numeric /proc entries via ls (no pipe needed); namespace-filtered unlike loadavg.
+        local f = IE.io.popen("ls /proc", "r")
+        if not f then return "[ERROR] cannot list /proc" end
+        local out = f:read("*a")
         f:close()
-        local total = line:match("%d+/(%d+)")
-        if total and tonumber(total) > 5 then
-            return string.format("[ESCAPED] /proc/loadavg shows %s host processes", total)
+        local count = 0
+        for entry in out:gmatch("[^\n]+") do
+            if entry:match("^%d+$") then count = count + 1 end
         end
-        return string.format("[CONTAINED] process count looks isolated: %s", tostring(total))
+        if count > 20 then
+            return string.format("[ESCAPED] /proc shows %d PIDs — host namespace visible", count)
+        end
+        return string.format("[CONTAINED] /proc shows %d PIDs (isolated namespace)", count)
     end)
 
     probe("PID ns — read parent (container manager) cmdline", function()
@@ -47,9 +64,10 @@ minetest.after(3, function()
         sf:close()
         if not ppid then return "[CONTAINED] could not parse PPID" end
 
+        -- In a proper PID namespace, PPID of init (PID 1) is 0 and /proc/0 does not exist.
         local cf = IE.io.open("/proc/" .. ppid .. "/cmdline", "r")
         if not cf then
-            return string.format("[CONTAINED] PPID=%s cmdline unreadable", ppid)
+            return string.format("[CONTAINED] PPID=%s cmdline unreadable (proper PID ns)", ppid)
         end
         local cmdline = cf:read("*a"):gsub("%z", " "):gsub("%s+$", "")
         cf:close()
@@ -57,140 +75,97 @@ minetest.after(3, function()
     end)
 
     -- [Attack 2] IPC namespace escape: missing CLONE_NEWIPC shares host SysV IPC objects.
-    probe("IPC ns — /proc/sysvipc/shm visible", function()
+    -- The file is always readable; the escape signal is actual data lines beyond the header.
+    probe("IPC ns — /proc/sysvipc/shm isolated", function()
         local f = IE.io.open("/proc/sysvipc/shm", "r")
         if not f then return "[CONTAINED] cannot open /proc/sysvipc/shm" end
-        local lines = 0
-        for _ in f:lines() do lines = lines + 1 end
+        local data_lines = 0
+        local first = true
+        for _ in f:lines() do
+            if first then first = false else data_lines = data_lines + 1 end
+        end
         f:close()
-        return string.format("[ESCAPED] sysvipc/shm accessible (%d lines incl. header)", lines)
+        if data_lines > 0 then
+            return string.format("[ESCAPED] IPC ns shared: %d host shm segment(s) visible", data_lines)
+        end
+        return "[CONTAINED] IPC ns isolated (0 shm segments)"
     end)
 
-    probe("IPC ns — /proc/sysvipc/sem visible", function()
+    probe("IPC ns — /proc/sysvipc/sem isolated", function()
         local f = IE.io.open("/proc/sysvipc/sem", "r")
         if not f then return "[CONTAINED] cannot open /proc/sysvipc/sem" end
-        local lines = 0
-        for _ in f:lines() do lines = lines + 1 end
+        local data_lines = 0
+        local first = true
+        for _ in f:lines() do
+            if first then first = false else data_lines = data_lines + 1 end
+        end
         f:close()
-        return string.format("[ESCAPED] sysvipc/sem accessible (%d lines)", lines)
+        if data_lines > 0 then
+            return string.format("[ESCAPED] IPC ns shared: %d host sem set(s) visible", data_lines)
+        end
+        return "[CONTAINED] IPC ns isolated (0 semaphore sets)"
     end)
 
-    -- [Attack 3] Network: no INPUT rule lets container reach host services via raw socket FFI.
-    probe("Network — reach host 172.18.0.1 (raw socket)", function()
-        if not ffi_ok then return "[SKIP] LuaJIT FFI unavailable" end
-
-        ffi.cdef[[
-            int socket(int domain, int type, int protocol);
-            int connect(int sockfd, const void *addr, unsigned int addrlen);
-            int close(int fd);
-        ]]
-
-        local AF_INET     = 2
-        local SOCK_STREAM = 1
-        local host_ip     = ffi.new("uint8_t[4]", {172, 18, 0, 1})
-
+    -- [Attack 3] Network: INPUT rule should block container from reaching host services.
+    -- Sequential nc calls are fine because REJECT returns RST immediately (<1ms each).
+    -- Background & was avoided: it keeps pipe write-ends open and can cause popen to hang.
+    probe("Network — reach host 172.18.0.1 (TCP connect)", function()
+        if not IE.io.popen then return "[SKIP] io.popen unavailable" end
         local open_ports = {}
-        for _, port in ipairs({22, 80, 443, 8080, 3000, 5000, 6379, 5432}) do
-            local sockaddr = ffi.new("uint8_t[16]")
-            sockaddr[0] = 2; sockaddr[1] = 0
-            sockaddr[2] = bit.rshift(port, 8)
-            sockaddr[3] = bit.band(port, 0xff)
-            ffi.copy(sockaddr + 4, host_ip, 4)
-
-            local fd = ffi.C.socket(AF_INET, SOCK_STREAM, 0)
-            if fd >= 0 then
-                local r = ffi.C.connect(fd, sockaddr, 16)
-                ffi.C.close(fd)
-                if r == 0 then
-                    open_ports[#open_ports + 1] = tostring(port)
-                end
+        for _, port in ipairs({22, 80, 443, 8080, 3000, 5432}) do
+            local out = popen("nc -z -w1 172.18.0.1 " .. port .. " 2>/dev/null; echo $?") or ""
+            if out:match("^0") then
+                open_ports[#open_ports + 1] = tostring(port)
             end
         end
-
         if #open_ports > 0 then
-            return "[ESCAPED] host ports reachable from container: " .. table.concat(open_ports, ",")
+            return "[ESCAPED] host ports reachable: " .. table.concat(open_ports, ",")
         end
-        return "[ESCAPED] gateway reachable but no standard ports open on host"
+        return "[CONTAINED] no host ports reachable (INPUT REJECT rule active)"
     end)
 
-    -- [Attack 4] FD inheritance: fds above 2 survive fork+exec without os.closerange.
-    probe("FD inheritance — unexpected open fds", function()
+    -- [Attack 4] FD inheritance: check for fds pointing to host-side paths.
+    -- Single ls call instead of 61 separate readlink processes.
+    probe("FD inheritance — leaked host fds", function()
+        if not IE.io.popen then return "[SKIP] io.popen unavailable" end
+        local out = popen("ls -la /proc/self/fd 2>/dev/null") or ""
         local leaked = {}
-        for i = 3, 63 do
-            local f = IE.io.open("/proc/self/fd/" .. i, "r")
-            if f then
-                f:close()
-                local info = IE.io.open("/proc/self/fdinfo/" .. i, "r")
-                local detail = "fd" .. i
-                if info then
-                    local pos = info:read("*l") or ""
-                    info:close()
-                    detail = detail .. "(" .. pos:sub(1, 40) .. ")"
+        for line in out:gmatch("[^\n]+") do
+            local target = line:match("%->%s+(.+)$")
+            if target then
+                target = target:gsub("%s+$", "")
+                if target:match("^/home/") or target:match("^/root/") or
+                   target:match("sandbox_") or target:match("^/sys/fs/cgroup") then
+                    local fd = line:match("%s(%d+)%s*%->")
+                    leaked[#leaked + 1] = "fd" .. (fd or "?") .. "->" .. target
                 end
-                leaked[#leaked + 1] = detail
             end
         end
         if #leaked > 0 then
-            return "[ESCAPED] inherited fds: " .. table.concat(leaked, " | ")
+            return "[ESCAPED] fds point to host paths: " .. table.concat(leaked, " | ")
         end
-        return "[CONTAINED] no fds beyond stdin/stdout/stderr"
+        return "[CONTAINED] no host-path fds inherited (closerange working)"
     end)
 
-    -- [Attack 5] User namespace: clone(CLONE_NEWUSER) unfiltered in seccomp lets process become UID 0.
+    -- [Attack 5] User namespace: clone(CLONE_NEWUSER) via unshare binary.
+    -- Seccomp would block this if CLONE_NEWUSER is filtered; without seccomp it succeeds.
     probe("User ns — clone(CLONE_NEWUSER) succeeds", function()
-        if not ffi_ok then return "[SKIP] LuaJIT FFI unavailable" end
-
-        ffi.cdef[[
-            long syscall(long number, ...);
-        ]]
-
-        local CLONE_NEWUSER = 0x10000000
-        local SYS_clone     = 56
-        local SYS_exit      = 60
-
-        local pid = ffi.C.syscall(SYS_clone, CLONE_NEWUSER, 0, nil, nil, 0)
-
-        if pid < 0 then
-            return "[CONTAINED] clone(CLONE_NEWUSER) blocked: errno=" .. tostring(-tonumber(pid))
+        if not IE.io.popen then return "[SKIP] io.popen unavailable" end
+        local out = popen("unshare --user id 2>&1; echo exitcode:$?") or ""
+        local code = out:match("exitcode:(%d+)")
+        if code == "0" then
+            local id_line = out:gsub("exitcode:%d+%s*$", ""):gsub("%s+$", "")
+            return "[ESCAPED] unshare --user succeeded (seccomp not blocking CLONE_NEWUSER): " .. id_line
         end
-
-        if pid == 0 then
-            local uid_map = IE.io.open("/proc/self/uid_map", "w")
-            local success = false
-            if uid_map then
-                uid_map:write("0 65534 1\n")
-                uid_map:close()
-                local sf = IE.io.open("/proc/self/status", "r")
-                if sf then
-                    for line in sf:lines() do
-                        local u = line:match("^Uid:%s*(%d+)")
-                        if u and tonumber(u) == 0 then success = true; break end
-                    end
-                    sf:close()
-                end
-            end
-            ffi.C.syscall(SYS_exit, success and 0 or 2)
-            return ""
-        end
-
-        ffi.cdef[[ int waitpid(int pid, int *wstatus, int options); ]]
-        local ws = ffi.new("int[1]")
-        ffi.C.waitpid(pid, ws, 0)
-        local exit_code = math.floor(ws[0] / 256) % 256
-
-        if exit_code == 0 then
-            return "[ESCAPED] clone(CLONE_NEWUSER) succeeded — child became UID 0 in new user namespace"
-        elseif exit_code == 2 then
-            return "[ESCAPED] clone(CLONE_NEWUSER) created namespace but uid_map write failed (partial escape)"
-        end
-        return "[CONTAINED] clone succeeded but could not become root in new namespace"
+        local err = out:gsub("exitcode:%d+%s*$", ""):gsub("%s+$", ""):sub(1, 80)
+        return "[CONTAINED] unshare --user blocked: " .. err
     end)
 
-    -- [Attack 6] No network namespace: CLONE_NEWNET conditional exposes host /proc/net when --port is omitted.
+    -- [Attack 6] No network namespace: CLONE_NEWNET conditional exposes host /proc/net.
     probe("Net ns — host connections visible (run without --port)", function()
         local tcp_f = IE.io.open("/proc/net/tcp", "r")
         if not tcp_f then return "[CONTAINED] cannot read /proc/net/tcp" end
-        local tcp_entries = -1  -- subtract header line
+        local tcp_entries = -1
         for _ in tcp_f:lines() do tcp_entries = tcp_entries + 1 end
         tcp_f:close()
 
@@ -213,43 +188,36 @@ minetest.after(3, function()
         )
     end)
 
-    -- [Attack 7] Seccomp mprotect bypass: PROT_EXEC unfiltered allows arbitrary native code execution.
+    -- [Attack 7] Seccomp mprotect bypass: mprotect(PROT_EXEC) unfiltered allows native code exec.
+    -- Invokes /usr/bin/luajit (available in the rootfs) with an FFI test script.
     probe("Seccomp — mprotect(PROT_EXEC) not filtered", function()
-        if not ffi_ok then return "[SKIP] LuaJIT FFI unavailable" end
+        if not IE.io.popen then return "[SKIP] io.popen unavailable" end
 
-        ffi.cdef[[
-            void *mmap(void *addr, size_t length, int prot, int flags, int fd, long offset);
-            int   mprotect(void *addr, size_t len, int prot);
-            int   munmap(void *addr, size_t length);
-        ]]
+        local script = [=[
+local ffi = require("ffi")
+ffi.cdef("void *mmap(void*,size_t,int,int,int,long); int mprotect(void*,size_t,int); int munmap(void*,size_t);")
+local PROT_READ, PROT_WRITE, PROT_EXEC = 1, 2, 4
+local MAP_PRIVATE, MAP_ANON = 0x02, 0x20
+local p = ffi.C.mmap(nil, 4096, PROT_READ+PROT_WRITE, MAP_PRIVATE+MAP_ANON, -1, 0)
+if p == ffi.cast("void*", ffi.cast("intptr_t", -1)) then print("MMAP_FAIL") os.exit(1) end
+local r = ffi.C.mprotect(p, 4096, PROT_READ+PROT_EXEC)
+ffi.C.munmap(p, 4096)
+print(r == 0 and "ESCAPED" or "CONTAINED")
+]=]
+        local tf = IE.io.open("/tmp/.mprotect_test.lua", "w")
+        if not tf then return "[ERROR] cannot write temp script" end
+        tf:write(script)
+        tf:close()
 
-        local PROT_READ   = 1
-        local PROT_WRITE  = 2
-        local PROT_EXEC   = 4
-        local MAP_PRIVATE = 0x02
-        local MAP_ANON    = 0x20
-
-        local page = ffi.C.mmap(nil, 4096, PROT_READ + PROT_WRITE, MAP_PRIVATE + MAP_ANON, -1, 0)
-        if page == ffi.cast("void*", ffi.cast("intptr_t", -1)) then
+        local out = popen("luajit /tmp/.mprotect_test.lua 2>/dev/null; echo exitcode:$?") or ""
+        if out:match("ESCAPED") then
+            return "[ESCAPED] mmap+mprotect(PROT_EXEC) allowed — arbitrary native code executable"
+        elseif out:match("CONTAINED") then
+            return "[CONTAINED] mprotect(PROT_EXEC) blocked by seccomp"
+        elseif out:match("MMAP_FAIL") then
             return "[CONTAINED] mmap failed"
         end
-
-        local code = ffi.cast("uint8_t*", page)
-        code[0] = 0x90  -- NOP
-        code[1] = 0x90  -- NOP
-        code[2] = 0xc3  -- RET
-
-        local rc = ffi.C.mprotect(page, 4096, PROT_READ + PROT_EXEC)
-        if rc ~= 0 then
-            ffi.C.munmap(page, 4096)
-            return "[CONTAINED] mprotect(PROT_EXEC) blocked by seccomp or kernel"
-        end
-
-        local fn = ffi.cast("void (*)(void)", page)
-        fn()
-
-        ffi.C.munmap(page, 4096)
-        return "[ESCAPED] Allocated and executed arbitrary native code (mmap+mprotect allowed)"
+        return "[ERROR] unexpected luajit output: " .. out:sub(1, 80)
     end)
 
     minetest.log("action", "[EVILMOD] ========== ATTACK ENDED ==========")
