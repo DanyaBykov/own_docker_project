@@ -49,8 +49,7 @@ ALLOWED_SYSCALLS = [
     332, # statx
 
     # --- Memory ---
-    9,   # mmap
-    10,  # mprotect
+    # mmap (9) and mprotect (10) are handled with PROT_EXEC conditions in prepare_seccomp()
     11,  # munmap
     12,  # brk
     25,  # mremap
@@ -59,7 +58,10 @@ ALLOWED_SYSCALLS = [
 
     # --- Process / thread ---
     39,  # getpid
-    56,  # clone
+    56,  # clone   — CLONE_NEWUSER blocked via seccomp arg filter in prepare_seccomp()
+    # clone3 (435) intentionally absent: default-deny (EPERM) prevents user-namespace
+    # creation via the new API. Do NOT add 435 without a matching CLONE_NEWUSER
+    # masked-arg rule in prepare_seccomp() first.
     57,  # fork
     58,  # vfork
     59,  # execve

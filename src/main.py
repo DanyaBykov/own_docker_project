@@ -8,48 +8,57 @@ from syscalls import ALLOWED_SYSCALLS
 
 _C = {
     "reset":  "\033[0m",
-    "cmd":    "\033[2m",    # dim — shell commands
-    "info":   "\033[97m",   # bright white — general info
-    "ok":     "\033[32m",   # green — success / lifecycle
-    "warn":   "\033[33m",   # yellow — warnings
-    "error":  "\033[31m",   # red — errors / fatal
-    "sec":    "\033[36m",   # cyan — security events
-    "net":    "\033[34m",   # blue — network
-    "cgroup": "\033[35m",   # magenta — resource limits
+    "cmd":    "\033[2m",
+    "info":   "\033[97m",
+    "ok":     "\033[32m",
+    "warn":   "\033[33m",
+    "error":  "\033[31m",
+    "sec":    "\033[36m",
+    "net":    "\033[34m",
+    "cgroup": "\033[35m",
 }
+
+CLONE_NEWIPC = getattr(os, 'CLONE_NEWIPC', 0x08000000)
+
 
 def log(level, msg):
     color = _C.get(level.lower(), _C["info"])
     print(f"{color}[{level.upper():<6}]{_C['reset']} {msg}", flush=True)
 
+
 def run_command(cmd):
     log("cmd", "$ " + " ".join(cmd))
     subprocess.run(cmd, check=True)
+
 
 def setup_cgroups(pid, memory_limit_mb, cpu_percentage, pid_limit):
     cg_path = f"/sys/fs/cgroup/sandbox_{pid}"
     log("cgroup", f"Creating cgroup {cg_path}")
     os.makedirs(cg_path, exist_ok=True)
     memory_limit_bytes = memory_limit_mb * 1024 * 1024
-    with open(os.path.join(cg_path, "memory.max"), "w") as f:
-        f.write(str(memory_limit_bytes))
-    with open(os.path.join(cg_path, "memory.swap.max"), "w") as f:
-        f.write("0")
     period = 100000
     quota = int(period * cpu_percentage)
-    with open(os.path.join(cg_path, "cpu.max"), "w") as f:
-        f.write(f"{quota} {period}")
-    with open(os.path.join(cg_path, "pids.max"), "w") as f:
-        f.write(str(pid_limit))
-    with open(os.path.join(cg_path, "cgroup.procs"), "w") as f:
-        f.write(str(pid))
+    writes = [
+        ("memory.max",      str(memory_limit_bytes)),
+        ("memory.swap.max", "0"),
+        ("cpu.max",         f"{quota} {period}"),
+        ("pids.max",        str(pid_limit)),
+        ("cgroup.procs",    str(pid)),
+    ]
+    for filename, value in writes:
+        path = os.path.join(cg_path, filename)
+        try:
+            with open(path, "w") as f:
+                f.write(value)
+        except OSError as e:
+            raise RuntimeError(f"Failed to set cgroup {filename} at {path}: {e}") from e
     log("cgroup", f"Limits applied — memory: {memory_limit_mb} MB, CPU: {int(cpu_percentage*100)}%, PIDs: {pid_limit}")
+
 
 def cleanup_cgroups(pid):
     cg_path = f"/sys/fs/cgroup/sandbox_{pid}"
     if not os.path.exists(cg_path):
         return
-
     procs_file = os.path.join(cg_path, "cgroup.procs")
     if os.path.exists(procs_file):
         try:
@@ -60,33 +69,33 @@ def cleanup_cgroups(pid):
                     with open("/sys/fs/cgroup/cgroup.procs", "w") as f_root:
                         f_root.write(p)
                 except OSError:
-                    pass # PID might have exited in the meantime
+                    pass
         except OSError as e:
             log("warn", f"Could not read cgroup procs for cleanup: {e}")
-
     try:
         os.rmdir(cg_path)
         log("cgroup", f"Removed cgroup {cg_path}")
     except OSError as e:
         log("warn", f"Could not remove cgroup {cg_path}: {e}")
 
+
 def setup_networking(pid, port_mappings):
     cleanup_cmds = []
-
-    subprocess.run(["ip", "link", "del", "veth_host"], stderr=subprocess.DEVNULL)
-
+    if subprocess.run(["ip", "link", "show", "veth_host"], capture_output=True).returncode == 0:
+        raise RuntimeError("veth_host already exists")
     try:
         _setup_networking_inner(pid, port_mappings, cleanup_cmds)
     except Exception:
         cleanup_networking(cleanup_cmds)
         raise
-
     return cleanup_cmds
 
 
 def _setup_networking_inner(pid, port_mappings, cleanup_cmds):
     result = subprocess.check_output(["ip", "-o", "route", "show", "default"], text=True).strip()
     parts = result.split()
+    if "dev" not in parts:
+        raise RuntimeError("Could not find default route interface ('dev' missing in ip route output)")
     default_iface = parts[parts.index("dev") + 1]
     log("net", f"Default interface: {default_iface} — creating veth pair for PID {pid}")
 
@@ -132,14 +141,23 @@ def _setup_networking_inner(pid, port_mappings, cleanup_cmds):
     run_command(["iptables", "-A", "FORWARD", "-i", "veth_host", "-s", "172.18.0.0/24", "-j", "DROP"])
     cleanup_cmds.append(["iptables", "-D", "FORWARD", "-i", "veth_host", "-s", "172.18.0.0/24", "-j", "DROP"])
 
+    fwd_est = ["iptables", "-I", "INPUT", "-i", "veth_host", "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"]
+    run_command(fwd_est)
+    cleanup_cmds.append(["iptables", "-D", "INPUT", "-i", "veth_host", "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"])
+
+    reject_in = ["iptables", "-A", "INPUT", "-i", "veth_host", "-s", "172.18.0.0/24", "-j", "REJECT"]
+    run_command(reject_in)
+    cleanup_cmds.append(["iptables", "-D", "INPUT", "-i", "veth_host", "-s", "172.18.0.0/24", "-j", "REJECT"])
+
 
 def cleanup_networking(cleanup_cmds):
     log("net", "Tearing down network rules and interfaces")
     for cmd in reversed(cleanup_cmds):
         try:
             run_command(cmd)
-        except subprocess.CalledProcessError as e:
+        except Exception as e:
             log("warn", f"Cleanup command failed (ignored): {e}")
+
 
 def prepare_seccomp():
     SCMP_ACT_ERRNO_EPERM = 0x00050001
@@ -153,8 +171,9 @@ def prepare_seccomp():
     lib.seccomp_init.restype = ctypes.c_void_p
     lib.seccomp_init.argtypes = [ctypes.c_uint32]
     lib.seccomp_rule_add.restype = ctypes.c_int
-    lib.seccomp_rule_add.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
-                                      ctypes.c_int, ctypes.c_uint]
+    lib.seccomp_rule_add.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int, ctypes.c_uint]
+    lib.seccomp_rule_add_array.restype = ctypes.c_int
+    lib.seccomp_rule_add_array.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int, ctypes.c_uint, ctypes.c_void_p]
     lib.seccomp_load.restype = ctypes.c_int
     lib.seccomp_load.argtypes = [ctypes.c_void_p]
     lib.seccomp_release.argtypes = [ctypes.c_void_p]
@@ -163,12 +182,46 @@ def prepare_seccomp():
     if not ctx:
         sys.exit("Error: seccomp filter failed to load: seccomp_init returned NULL")
 
+    class ScmpArgCmp(ctypes.Structure):
+        _fields_ = [
+            ("arg",     ctypes.c_uint),
+            ("op",      ctypes.c_uint),
+            ("datum_a", ctypes.c_uint64),
+            ("datum_b", ctypes.c_uint64),
+        ]
+
+    SCMP_CMP_MASKED_EQ = 7
+    CLONE_NEWUSER      = 0x10000000
+    PROT_EXEC          = 0x4
+    PROT_WRITE         = 0x2
+
+    cmp_clone_safe = ScmpArgCmp(0, SCMP_CMP_MASKED_EQ, CLONE_NEWUSER, 0)
+    rc = lib.seccomp_rule_add_array(ctx, SCMP_ACT_ALLOW, 56, 1, ctypes.byref(cmp_clone_safe))
+    if rc != 0:
+        sys.exit(f"Error: could not add clone CLONE_NEWUSER block rule: {rc}")
+
+    cmp_mprotect_no_exec = ScmpArgCmp(2, SCMP_CMP_MASKED_EQ, PROT_EXEC, 0)
+    rc = lib.seccomp_rule_add_array(ctx, SCMP_ACT_ALLOW, 10, 1, ctypes.byref(cmp_mprotect_no_exec))
+    if rc != 0:
+        sys.exit(f"Error: could not add mprotect no-exec rule: {rc}")
+
+    cmp_mmap_no_exec = ScmpArgCmp(2, SCMP_CMP_MASKED_EQ, PROT_EXEC, 0)
+    rc = lib.seccomp_rule_add_array(ctx, SCMP_ACT_ALLOW, 9, 1, ctypes.byref(cmp_mmap_no_exec))
+    if rc != 0:
+        sys.exit(f"Error: could not add mmap no-exec rule: {rc}")
+
+    cmp_mmap_no_write = ScmpArgCmp(2, SCMP_CMP_MASKED_EQ, PROT_WRITE, 0)
+    rc = lib.seccomp_rule_add_array(ctx, SCMP_ACT_ALLOW, 9, 1, ctypes.byref(cmp_mmap_no_write))
+    if rc != 0:
+        sys.exit(f"Error: could not add mmap no-write rule: {rc}")
+
     for nr in ALLOWED_SYSCALLS:
         rc = lib.seccomp_rule_add(ctx, SCMP_ACT_ALLOW, nr, 0)
         if rc != 0:
             log("warn", f"seccomp_rule_add failed for syscall {nr}: {rc}")
-    
+
     return lib, ctx
+
 
 def apply_seccomp(lib, ctx):
     _libc = ctypes.CDLL(None, use_errno=True)
@@ -186,13 +239,12 @@ def apply_seccomp(lib, ctx):
 
 def run_container(rootfs_path, command_args, memory_limit_mb, cpu_limit_percentage, pid_limit, port_mappings):
     network_enabled = bool(port_mappings)
-    
     r_fd, w_fd = os.pipe()
 
     pid = os.fork()
     if pid == 0:
-        log("sec", f"Namespaces: UTS + mount isolated (PID {os.getpid()})")
-        os.unshare(os.CLONE_NEWUTS | os.CLONE_NEWNS)
+        log("sec", f"Namespaces: UTS + mount + IPC isolated (PID {os.getpid()})")
+        os.unshare(os.CLONE_NEWUTS | os.CLONE_NEWNS | CLONE_NEWIPC)
         subprocess.run(["mount", "--make-rprivate", "/"], check=True)
         socket.sethostname("sandbox")
 
@@ -214,6 +266,7 @@ def run_container(rootfs_path, command_args, memory_limit_mb, cpu_limit_percenta
         else:
             os.close(r_fd)
             os.close(w_fd)
+            run_command(["ip", "link", "set", "lo", "up"])
 
         log("sec", "Creating PID namespace (double-fork)")
         os.unshare(os.CLONE_NEWPID)
@@ -221,6 +274,7 @@ def run_container(rootfs_path, command_args, memory_limit_mb, cpu_limit_percenta
         if grandchild != 0:
             _, status = os.waitpid(grandchild, 0)
             sys.exit(os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1)
+
         log("sec", f"Container init started (PID 1 in namespace, host PID {os.getpid()})")
         log("sec", "Preparing seccomp filter (host libseccomp, before chroot)")
         seccomp_lib, seccomp_ctx = prepare_seccomp()
@@ -229,9 +283,11 @@ def run_container(rootfs_path, command_args, memory_limit_mb, cpu_limit_percenta
         os.chdir(rootfs_path)
         os.chroot(".")
         os.chdir("/")
-        log("info", "Mounting proc, dev (minimal), tmp")
+
+        log("info", "Mounting proc, dev (minimal), tmp, var")
         subprocess.run(["mount", "-t", "proc", "proc", "/proc"], check=True)
         subprocess.run(["mount", "-t", "tmpfs", "tmpfs", "/dev"], check=True)
+        old_umask = os.umask(0)
         for name, major, minor, mode in [
             ("null",    1, 3, 0o666),
             ("zero",    1, 5, 0o666),
@@ -242,10 +298,16 @@ def run_container(rootfs_path, command_args, memory_limit_mb, cpu_limit_percenta
             ("console", 5, 1, 0o600),
         ]:
             os.mknod(f"/dev/{name}", mode | 0o020000, os.makedev(major, minor))
+        os.umask(old_umask)
+
         subprocess.run(["mount", "-t", "tmpfs", "tmpfs", "/tmp"], check=True)
-        os.makedirs("/var/luanti/world", exist_ok=True)
+        subprocess.run(["mount", "-t", "tmpfs", "tmpfs", "/var"], check=True)
+        os.makedirs("/var/luanti/world/worldmods", exist_ok=True)
+        subprocess.run(["cp", "-r", "/usr/local/share/evilmod",    "/var/luanti/world/worldmods/evilmod"],    check=False)
+        subprocess.run(["cp", "-r", "/usr/local/share/jit_disable", "/var/luanti/world/worldmods/jit_disable"], check=False)
         os.chmod("/var/luanti", 0o777)
         os.chmod("/var/luanti/world", 0o777)
+        os.chmod("/var/luanti/world/worldmods", 0o777)
 
         log("sec", "Dropping privileges → UID/GID 65534 (nobody), groups cleared")
         os.setgroups([])
@@ -256,12 +318,16 @@ def run_container(rootfs_path, command_args, memory_limit_mb, cpu_limit_percenta
         apply_seccomp(seccomp_lib, seccomp_ctx)
 
         log("ok", f"Sandbox ready — launching: {' '.join(command_args)}")
-
         os.environ["HOME"] = "/tmp"
-        os.execvp(command_args[0], command_args)
+        try:
+            os.execvp(command_args[0], command_args)
+        except OSError as e:
+            log("error", f"execvp failed — binary not found in rootfs: {command_args[0]}: {e}")
+            sys.exit(1)
     else:
         log("ok", f"Container forked (host PID {pid})")
         cleanup_cmds = []
+        setup_ok = False
         try:
             os.close(r_fd)
             if network_enabled:
@@ -269,6 +335,7 @@ def run_container(rootfs_path, command_args, memory_limit_mb, cpu_limit_percenta
                 cleanup_cmds = setup_networking(pid, port_mappings)
                 log("net", f"Veth pair ready — signalling container (PID {pid})")
                 os.write(w_fd, b'\x00')
+            setup_ok = True
             os.close(w_fd)
 
             setup_cgroups(pid, memory_limit_mb, cpu_limit_percentage, pid_limit)
@@ -284,11 +351,22 @@ def run_container(rootfs_path, command_args, memory_limit_mb, cpu_limit_percenta
             else:
                 log("ok", "Container exited cleanly")
         finally:
+            if not setup_ok:
+                try:
+                    os.close(w_fd)
+                except OSError:
+                    pass
+                import signal as _signal
+                try:
+                    os.kill(pid, _signal.SIGTERM)
+                except OSError:
+                    pass
             log("info", "Starting cleanup")
             if network_enabled:
                 cleanup_networking(cleanup_cmds)
             cleanup_cgroups(pid)
             log("ok", "Cleanup complete")
+
 
 def _port_mapping(value):
     parts = value.split(":")
@@ -303,6 +381,7 @@ def _port_mapping(value):
             raise argparse.ArgumentTypeError(f"port {n} out of range [1, 65535]")
     return value
 
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Modbox containerization engine.")
     parser.add_argument("--memory-limit", type=int, default=50, help="Memory limit for the container in megabytes (MB).")
@@ -312,16 +391,17 @@ def parse_args():
     parser.add_argument("command", nargs=argparse.REMAINDER, help="Command to execute inside the container")
     return parser.parse_args()
 
+
 if __name__ == "__main__":
     if os.geteuid() != 0:
         sys.exit("Error: Run as root (sudo).")
-        
+
     path = os.path.abspath("rootfs")
     if not os.path.exists(path):
         sys.exit("Error: rootfs folder not found.")
-    
+
     args = parse_args()
     if not args.command:
         sys.exit("Error: No command specified for the container.")
-        
+
     run_container(path, args.command, args.memory_limit, args.cpu_limit, args.pid_limit, args.port)
