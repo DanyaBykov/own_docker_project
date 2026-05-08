@@ -50,10 +50,10 @@ shutil.rmtree("/tmp/mc2_extract")
 print(f"MineClone2 installed at {dest}")
 PYEOF
 
-echo "Copying test scripts into rootfs..."
 mkdir -p rootfs/src
-cp src/security_test.py rootfs/src/security_test.py
-cp src/stress.py rootfs/src/stress.py
+
+echo "Creating world directory and server config..."
+mkdir -p rootfs/var/luanti/world
 
 echo "Creating server config and staging evil mod..."
 cat > rootfs/etc/luanti.conf << 'EOF'
