@@ -16,8 +16,9 @@ echo "Preparing DNS for package installation..."
 cp /etc/resolv.conf rootfs/etc/resolv.conf
 
 # minetest-server: headless server binary; minetest-mineclone2: the only game in Alpine 3.18 repos
+# libseccomp: required by the host's seccomp filter (loaded via ctypes inside the chroot)
 echo "Installing Minetest server..."
-chroot rootfs /bin/sh -c "apk update && apk add minetest-server minetest-mineclone2"
+chroot rootfs /bin/sh -c "apk update && apk add minetest-server minetest-mineclone2 libseccomp"
 
 echo "Creating world directory and server config..."
 mkdir -p rootfs/var/luanti/world
