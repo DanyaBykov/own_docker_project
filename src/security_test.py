@@ -41,7 +41,13 @@ def probe_syscalls():
     escaped = False
     detail = ""
     try:
-        libc = ctypes.CDLL("libc.so.6")
+        from ctypes.util import find_library
+        libc_path = find_library("c")
+        if not libc_path:
+            # Fallback for Alpine/musl
+            libc_path = "libc.musl-x86_64.so.1"
+        libc = ctypes.CDLL(libc_path, use_errno=True)
+        # ptrace(PTRACE_TRACEME, 0, 0, 0)
         res = libc.ptrace(0, 0, 0, 0)
         escaped = (res == 0)
     except Exception as e:

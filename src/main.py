@@ -4,13 +4,31 @@ import socket
 import argparse
 import subprocess
 import ctypes
+from syscalls import ALLOWED_SYSCALLS
+
+_C = {
+    "reset":  "\033[0m",
+    "cmd":    "\033[2m",    # dim — shell commands
+    "info":   "\033[97m",   # bright white — general info
+    "ok":     "\033[32m",   # green — success / lifecycle
+    "warn":   "\033[33m",   # yellow — warnings
+    "error":  "\033[31m",   # red — errors / fatal
+    "sec":    "\033[36m",   # cyan — security events
+    "net":    "\033[34m",   # blue — network
+    "cgroup": "\033[35m",   # magenta — resource limits
+}
+
+def log(level, msg):
+    color = _C.get(level.lower(), _C["info"])
+    print(f"{color}[{level.upper():<6}]{_C['reset']} {msg}", flush=True)
 
 def run_command(cmd):
-    print(f"Executing: {cmd}")
-    subprocess.run(cmd, shell=True, check=True)
+    log("cmd", "$ " + " ".join(cmd))
+    subprocess.run(cmd, check=True)
 
 def setup_cgroups(pid, memory_limit_mb, cpu_percentage, pid_limit):
     cg_path = f"/sys/fs/cgroup/sandbox_{pid}"
+    log("cgroup", f"Creating cgroup {cg_path}")
     os.makedirs(cg_path, exist_ok=True)
     memory_limit_bytes = memory_limit_mb * 1024 * 1024
     with open(os.path.join(cg_path, "memory.max"), "w") as f:
@@ -25,27 +43,37 @@ def setup_cgroups(pid, memory_limit_mb, cpu_percentage, pid_limit):
         f.write(str(pid_limit))
     with open(os.path.join(cg_path, "cgroup.procs"), "w") as f:
         f.write(str(pid))
+    log("cgroup", f"Limits applied — memory: {memory_limit_mb} MB, CPU: {int(cpu_percentage*100)}%, PIDs: {pid_limit}")
 
 def cleanup_cgroups(pid):
     cg_path = f"/sys/fs/cgroup/sandbox_{pid}"
     if not os.path.exists(cg_path):
         return
-    try:
-        with open("/sys/fs/cgroup/cgroup.procs", "w") as f:
-            f.write(str(os.getpid()))
-    except OSError as e:
-        print(f"Warning: could not drain cgroup procs: {e}")
+
+    procs_file = os.path.join(cg_path, "cgroup.procs")
+    if os.path.exists(procs_file):
+        try:
+            with open(procs_file, "r") as f:
+                pids = f.read().split()
+            for p in pids:
+                try:
+                    with open("/sys/fs/cgroup/cgroup.procs", "w") as f_root:
+                        f_root.write(p)
+                except OSError:
+                    pass # PID might have exited in the meantime
+        except OSError as e:
+            log("warn", f"Could not read cgroup procs for cleanup: {e}")
+
     try:
         os.rmdir(cg_path)
-        print(f"Cleaned up cgroup: {cg_path}")
+        log("cgroup", f"Removed cgroup {cg_path}")
     except OSError as e:
-        print(f"Warning: could not remove cgroup {cg_path}: {e}")
+        log("warn", f"Could not remove cgroup {cg_path}: {e}")
 
 def setup_networking(pid, port_mappings):
     cleanup_cmds = []
 
-    # Delete any leftover veth from a previous crashed run — safe to ignore failure.
-    subprocess.run("ip link del veth_host", shell=True, stderr=subprocess.DEVNULL)
+    subprocess.run(["ip", "link", "del", "veth_host"], stderr=subprocess.DEVNULL)
 
     try:
         _setup_networking_inner(pid, port_mappings, cleanup_cmds)
@@ -57,171 +85,70 @@ def setup_networking(pid, port_mappings):
 
 
 def _setup_networking_inner(pid, port_mappings, cleanup_cmds):
-    default_iface = subprocess.check_output("ip route | grep '^default' | awk '{print $5}'", shell=True).decode().strip()
+    result = subprocess.check_output(["ip", "-o", "route", "show", "default"], text=True).strip()
+    parts = result.split()
+    default_iface = parts[parts.index("dev") + 1]
+    log("net", f"Default interface: {default_iface} — creating veth pair for PID {pid}")
 
-    run_command("sysctl -w net.ipv4.ip_forward=1")
-    cleanup_cmds.append("sysctl -w net.ipv4.ip_forward=0")
+    orig_ip_forward = subprocess.check_output(["sysctl", "-n", "net.ipv4.ip_forward"], text=True).strip()
+    run_command(["sysctl", "-w", "net.ipv4.ip_forward=1"])
+    cleanup_cmds.append(["sysctl", "-w", f"net.ipv4.ip_forward={orig_ip_forward}"])
 
-    run_command("ip link add veth_host type veth peer name veth_container")
-    cleanup_cmds.append("ip link del veth_host")
-    
-    run_command("ip link set veth_host up")
-    run_command("ip addr add 172.18.0.1/24 dev veth_host")
-    run_command(f"ip link set veth_container netns {pid}")
-    
-    nat_rule = f"iptables -t nat -A POSTROUTING -s 172.18.0.0/24 -o {default_iface} -j MASQUERADE"
-    run_command(nat_rule)
-    cleanup_cmds.append(nat_rule.replace("-A", "-D"))
+    run_command(["ip", "link", "add", "veth_host", "type", "veth", "peer", "name", "veth_container"])
+    cleanup_cmds.append(["ip", "link", "del", "veth_host"])
 
-    # MASQUERADE traffic going into the container so its responses route back via
-    # veth_host rather than trying to reach 127.0.0.1 through a non-loopback path.
-    run_command("iptables -t nat -A POSTROUTING -d 172.18.0.0/24 -j MASQUERADE")
-    cleanup_cmds.append("iptables -t nat -D POSTROUTING -d 172.18.0.0/24 -j MASQUERADE")
+    run_command(["ip", "link", "set", "veth_host", "up"])
+    run_command(["ip", "addr", "add", "172.18.0.1/24", "dev", "veth_host"])
+    run_command(["ip", "link", "set", "veth_container", "netns", str(pid)])
 
-    # Allow the kernel to route loopback-addressed packets through veth interfaces.
-    run_command("sysctl -w net.ipv4.conf.all.route_localnet=1")
-    cleanup_cmds.append("sysctl -w net.ipv4.conf.all.route_localnet=0")
+    run_command(["iptables", "-t", "nat", "-A", "POSTROUTING", "-s", "172.18.0.0/24", "-o", default_iface, "-j", "MASQUERADE"])
+    cleanup_cmds.append(["iptables", "-t", "nat", "-D", "POSTROUTING", "-s", "172.18.0.0/24", "-o", default_iface, "-j", "MASQUERADE"])
 
-    # Allow return traffic for established connections
-    run_command("iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT")
-    cleanup_cmds.append("iptables -D FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT")
+    run_command(["iptables", "-t", "nat", "-A", "POSTROUTING", "-d", "172.18.0.0/24", "-j", "MASQUERADE"])
+    cleanup_cmds.append(["iptables", "-t", "nat", "-D", "POSTROUTING", "-d", "172.18.0.0/24", "-j", "MASQUERADE"])
 
-    # Allow DNS outbound so the server can resolve hostnames
-    run_command("iptables -A FORWARD -s 172.18.0.0/24 -p udp --dport 53 -j ACCEPT")
-    cleanup_cmds.append("iptables -D FORWARD -s 172.18.0.0/24 -p udp --dport 53 -j ACCEPT")
-    run_command("iptables -A FORWARD -s 172.18.0.0/24 -p tcp --dport 53 -j ACCEPT")
-    cleanup_cmds.append("iptables -D FORWARD -s 172.18.0.0/24 -p tcp --dport 53 -j ACCEPT")
+    run_command(["sysctl", "-w", "net.ipv4.conf.veth_host.route_localnet=1"])
+
+    run_command(["iptables", "-A", "FORWARD", "-i", "veth_host", "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"])
+    cleanup_cmds.append(["iptables", "-D", "FORWARD", "-i", "veth_host", "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"])
+    run_command(["iptables", "-A", "FORWARD", "-o", "veth_host", "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"])
+    cleanup_cmds.append(["iptables", "-D", "FORWARD", "-o", "veth_host", "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"])
+
+    run_command(["iptables", "-A", "FORWARD", "-i", "veth_host", "-s", "172.18.0.0/24", "-p", "udp", "--dport", "53", "-j", "ACCEPT"])
+    cleanup_cmds.append(["iptables", "-D", "FORWARD", "-i", "veth_host", "-s", "172.18.0.0/24", "-p", "udp", "--dport", "53", "-j", "ACCEPT"])
+    run_command(["iptables", "-A", "FORWARD", "-i", "veth_host", "-s", "172.18.0.0/24", "-p", "tcp", "--dport", "53", "-j", "ACCEPT"])
+    cleanup_cmds.append(["iptables", "-D", "FORWARD", "-i", "veth_host", "-s", "172.18.0.0/24", "-p", "tcp", "--dport", "53", "-j", "ACCEPT"])
 
     for mapping in port_mappings:
         host_port, container_port = mapping.split(":")
         for proto in ("tcp", "udp"):
-            # PREROUTING: packets arriving on a real interface
-            dnat_pre = f"iptables -t nat -A PREROUTING -p {proto} --dport {host_port} -j DNAT --to-destination 172.18.0.2:{container_port}"
-            run_command(dnat_pre)
-            cleanup_cmds.append(dnat_pre.replace("-A", "-D"))
-            # OUTPUT: packets from localhost connecting to localhost:host_port
-            dnat_out = f"iptables -t nat -A OUTPUT -p {proto} -d 127.0.0.1 --dport {host_port} -j DNAT --to-destination 172.18.0.2:{container_port}"
-            run_command(dnat_out)
-            cleanup_cmds.append(dnat_out.replace("-A", "-D"))
-            # FORWARD inbound: traffic arriving at the container after DNAT
-            fwd_in = f"iptables -A FORWARD -d 172.18.0.0/24 -p {proto} --dport {container_port} -j ACCEPT"
-            run_command(fwd_in)
-            cleanup_cmds.append(fwd_in.replace("-A", "-D"))
+            run_command(["iptables", "-t", "nat", "-A", "PREROUTING", "-p", proto, "--dport", host_port, "-j", "DNAT", "--to-destination", f"172.18.0.2:{container_port}"])
+            cleanup_cmds.append(["iptables", "-t", "nat", "-D", "PREROUTING", "-p", proto, "--dport", host_port, "-j", "DNAT", "--to-destination", f"172.18.0.2:{container_port}"])
+            run_command(["iptables", "-t", "nat", "-A", "OUTPUT", "-p", proto, "-d", "127.0.0.1", "--dport", host_port, "-j", "DNAT", "--to-destination", f"172.18.0.2:{container_port}"])
+            cleanup_cmds.append(["iptables", "-t", "nat", "-D", "OUTPUT", "-p", proto, "-d", "127.0.0.1", "--dport", host_port, "-j", "DNAT", "--to-destination", f"172.18.0.2:{container_port}"])
+            run_command(["iptables", "-A", "FORWARD", "-o", "veth_host", "-d", "172.18.0.0/24", "-p", proto, "--dport", container_port, "-j", "ACCEPT"])
+            cleanup_cmds.append(["iptables", "-D", "FORWARD", "-o", "veth_host", "-d", "172.18.0.0/24", "-p", proto, "--dport", container_port, "-j", "ACCEPT"])
 
-    # Drop all other outbound traffic from the container
-    run_command("iptables -A FORWARD -s 172.18.0.0/24 -j DROP")
-    cleanup_cmds.append("iptables -D FORWARD -s 172.18.0.0/24 -j DROP")
+    run_command(["iptables", "-A", "FORWARD", "-i", "veth_host", "-s", "172.18.0.0/24", "-j", "DROP"])
+    cleanup_cmds.append(["iptables", "-D", "FORWARD", "-i", "veth_host", "-s", "172.18.0.0/24", "-j", "DROP"])
 
 
 def cleanup_networking(cleanup_cmds):
+    log("net", "Tearing down network rules and interfaces")
     for cmd in reversed(cleanup_cmds):
         try:
             run_command(cmd)
         except subprocess.CalledProcessError as e:
-            print(f"Warning: cleanup command failed (ignored): {e}")
+            log("warn", f"Cleanup command failed (ignored): {e}")
 
-def setup_seccomp():
+def prepare_seccomp():
     SCMP_ACT_ERRNO_EPERM = 0x00050001
     SCMP_ACT_ALLOW       = 0x7fff0000
-
-    # syscall numbers for x86_64 Linux
-    ALLOWED_SYSCALLS = [
-        0,   # read
-        1,   # write
-        2,   # open
-        3,   # close
-        4,   # stat
-        5,   # fstat
-        6,   # lstat
-        8,   # lseek
-        9,   # mmap
-        10,  # mprotect
-        11,  # munmap
-        12,  # brk
-        13,  # rt_sigaction
-        14,  # rt_sigprocmask
-        17,  # pread64
-        18,  # pwrite64
-        19,  # readv
-        20,  # writev
-        21,  # access
-        23,  # select
-        24,  # sched_yield
-        28,  # madvise
-        32,  # dup
-        33,  # dup2
-        39,  # getpid
-        41,  # socket
-        42,  # connect
-        43,  # accept
-        44,  # sendto
-        45,  # recvfrom
-        46,  # sendmsg
-        47,  # recvmsg
-        48,  # shutdown
-        49,  # bind
-        50,  # listen
-        51,  # getsockname
-        52,  # getpeername
-        54,  # setsockopt
-        55,  # getsockopt
-        56,  # clone
-        57,  # fork
-        58,  # vfork
-        60,  # exit
-        61,  # wait4
-        63,  # uname
-        72,  # fcntl
-        73,  # flock
-        74,  # fsync
-        78,  # getdents
-        79,  # getcwd
-        80,  # chdir
-        82,  # rename
-        83,  # mkdir
-        84,  # rmdir
-        85,  # creat
-        86,  # link
-        87,  # unlink
-        88,  # symlink
-        89,  # readlink
-        90,  # chmod
-        91,  # fchmod
-        95,  # umask
-        96,  # gettimeofday
-        97,  # getrlimit
-        99,  # sysinfo
-        100, # times
-        102, # getuid
-        104, # getgid
-        107, # geteuid
-        108, # getegid
-        110, # getppid
-        111, # getpgrp
-        112, # setsid
-        128, # rt_sigreturn
-        158, # arch_prctl
-        186, # gettid
-        202, # futex
-        218, # set_tid_address
-        228, # clock_gettime
-        231, # exit_group
-        257, # openat
-        262, # newfstatat
-        267, # readlinkat
-        273, # set_robust_list
-        274, # get_robust_list
-        293, # pipe2
-        302, # prlimit64
-        318, # getrandom
-        334, # rseq
-    ]
 
     try:
         lib = ctypes.CDLL("libseccomp.so.2", use_errno=True)
     except OSError as e:
-        print(f"Warning: could not load libseccomp, skipping seccomp filter: {e}")
-        return
+        sys.exit(f"Error: seccomp filter failed to load: could not load libseccomp: {e}")
 
     lib.seccomp_init.restype = ctypes.c_void_p
     lib.seccomp_init.argtypes = [ctypes.c_uint32]
@@ -234,20 +161,26 @@ def setup_seccomp():
 
     ctx = lib.seccomp_init(SCMP_ACT_ERRNO_EPERM)
     if not ctx:
-        print("Warning: seccomp_init returned NULL, skipping seccomp filter")
-        return
+        sys.exit("Error: seccomp filter failed to load: seccomp_init returned NULL")
 
     for nr in ALLOWED_SYSCALLS:
         rc = lib.seccomp_rule_add(ctx, SCMP_ACT_ALLOW, nr, 0)
         if rc != 0:
-            print(f"Warning: seccomp_rule_add failed for syscall {nr}: {rc}")
+            log("warn", f"seccomp_rule_add failed for syscall {nr}: {rc}")
+    
+    return lib, ctx
+
+def apply_seccomp(lib, ctx):
+    _libc = ctypes.CDLL(None, use_errno=True)
+    PR_SET_NO_NEW_PRIVS = 38
+    if _libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+        sys.exit("Error: prctl(PR_SET_NO_NEW_PRIVS) failed")
+    log("sec", "PR_SET_NO_NEW_PRIVS set — no privilege escalation via exec")
 
     rc = lib.seccomp_load(ctx)
     if rc != 0:
-        print(f"Warning: seccomp_load failed: {rc}. Continuing without seccomp.")
-    else:
-        print("Seccomp filter loaded.")
-
+        sys.exit(f"Error: seccomp filter failed to load: seccomp_load returned {rc}")
+    log("sec", f"Seccomp allowlist loaded ({len(ALLOWED_SYSCALLS)} syscalls, default action: EPERM)")
     lib.seccomp_release(ctx)
 
 
@@ -258,69 +191,124 @@ def run_container(rootfs_path, command_args, memory_limit_mb, cpu_limit_percenta
 
     pid = os.fork()
     if pid == 0:
-        # Create isolated namespaces in the child so the parent's subprocesses
-        # (ip, iptables, sysctl) stay in the host namespaces and can see the
-        # child's PID when setting up the veth pair.
+        log("sec", f"Namespaces: UTS + mount isolated (PID {os.getpid()})")
         os.unshare(os.CLONE_NEWUTS | os.CLONE_NEWNS)
-        # Prevent mount events from propagating back to the host namespace.
-        # Without this, mounts inside the container leak into the host's /dev.
-        os.system("mount --make-rprivate /")
+        subprocess.run(["mount", "--make-rprivate", "/"], check=True)
         socket.sethostname("sandbox")
-        os.chdir(rootfs_path)
-        os.chroot(".")
-        os.chdir("/")
-        os.system("mount -t proc proc /proc")
-        os.system("mount -t devtmpfs devtmpfs /dev")
-        os.system("mount -t tmpfs tmpfs /tmp")
-        os.system("mount -t tmpfs tmpfs /var")
-        # Create world and home dirs in the fresh /var and /tmp tmpfs while
-        # still root, then open them to writes by the unprivileged process.
-        os.system("mkdir -p /var/luanti/world")
-        os.system("chmod 777 /var/luanti /var/luanti/world")
-        
+
         if network_enabled:
+            log("net", "Isolating network namespace")
             os.unshare(os.CLONE_NEWNET)
             os.close(w_fd)
-            os.read(r_fd, 1)   # block until parent finishes veth setup
+            signal = os.read(r_fd, 1)
+            if not signal:
+                log("error", "Parent process died or closed pipe before network setup complete")
+                sys.exit(1)
             os.close(r_fd)
-            run_command("ip link set lo up")
-            run_command("ip link set veth_container up")
-            run_command("ip addr add 172.18.0.2/24 dev veth_container")
-            run_command("ip route add default via 172.18.0.1")
+            log("net", "Parent signalled veth ready — configuring container side")
+            run_command(["ip", "link", "set", "lo", "up"])
+            run_command(["ip", "link", "set", "veth_container", "up"])
+            run_command(["ip", "addr", "add", "172.18.0.2/24", "dev", "veth_container"])
+            run_command(["ip", "route", "add", "default", "via", "172.18.0.1"])
+            log("net", "Container network ready (172.18.0.2/24, gw 172.18.0.1)")
         else:
             os.close(r_fd)
             os.close(w_fd)
 
+        log("sec", "Creating PID namespace (double-fork)")
+        os.unshare(os.CLONE_NEWPID)
+        grandchild = os.fork()
+        if grandchild != 0:
+            _, status = os.waitpid(grandchild, 0)
+            sys.exit(os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1)
+        log("sec", f"Container init started (PID 1 in namespace, host PID {os.getpid()})")
+        log("sec", "Preparing seccomp filter (host libseccomp, before chroot)")
+        seccomp_lib, seccomp_ctx = prepare_seccomp()
+
+        log("info", f"Chrooting into {rootfs_path}")
+        os.chdir(rootfs_path)
+        os.chroot(".")
+        os.chdir("/")
+        log("info", "Mounting proc, dev (minimal), tmp")
+        subprocess.run(["mount", "-t", "proc", "proc", "/proc"], check=True)
+        subprocess.run(["mount", "-t", "tmpfs", "tmpfs", "/dev"], check=True)
+        for name, major, minor, mode in [
+            ("null",    1, 3, 0o666),
+            ("zero",    1, 5, 0o666),
+            ("full",    1, 7, 0o666),
+            ("random",  1, 8, 0o444),
+            ("urandom", 1, 9, 0o444),
+            ("tty",     5, 0, 0o666),
+            ("console", 5, 1, 0o600),
+        ]:
+            os.mknod(f"/dev/{name}", mode | 0o020000, os.makedev(major, minor))
+        subprocess.run(["mount", "-t", "tmpfs", "tmpfs", "/tmp"], check=True)
+        os.makedirs("/var/luanti/world", exist_ok=True)
+        os.chmod("/var/luanti", 0o777)
+        os.chmod("/var/luanti/world", 0o777)
+
+        log("sec", "Dropping privileges → UID/GID 65534 (nobody), groups cleared")
+        os.setgroups([])
         os.setgid(65534)
         os.setuid(65534)
 
-        setup_seccomp()
+        log("sec", "Applying seccomp filter")
+        apply_seccomp(seccomp_lib, seccomp_ctx)
+
+        log("ok", f"Sandbox ready — launching: {' '.join(command_args)}")
 
         os.environ["HOME"] = "/tmp"
         os.execvp(command_args[0], command_args)
     else:
+        log("ok", f"Container forked (host PID {pid})")
         cleanup_cmds = []
         try:
             os.close(r_fd)
             if network_enabled:
+                log("net", "Setting up host-side networking")
                 cleanup_cmds = setup_networking(pid, port_mappings)
+                log("net", f"Veth pair ready — signalling container (PID {pid})")
                 os.write(w_fd, b'\x00')
             os.close(w_fd)
 
             setup_cgroups(pid, memory_limit_mb, cpu_limit_percentage, pid_limit)
+            log("ok", "Container running")
 
-            os.waitpid(pid, 0)
+            _, status = os.waitpid(pid, 0)
+            if os.WIFSIGNALED(status):
+                sig = os.WTERMSIG(status)
+                label = "OOM kill" if sig == 9 else f"signal {sig}"
+                log("error", f"Container killed by {label}")
+            elif os.WIFEXITED(status) and os.WEXITSTATUS(status) != 0:
+                log("error", f"Container exited with code {os.WEXITSTATUS(status)}")
+            else:
+                log("ok", "Container exited cleanly")
         finally:
+            log("info", "Starting cleanup")
             if network_enabled:
                 cleanup_networking(cleanup_cmds)
             cleanup_cgroups(pid)
+            log("ok", "Cleanup complete")
+
+def _port_mapping(value):
+    parts = value.split(":")
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError(f"expected host:container, got {value!r}")
+    for p in parts:
+        try:
+            n = int(p)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"port must be an integer, got {p!r}")
+        if not 1 <= n <= 65535:
+            raise argparse.ArgumentTypeError(f"port {n} out of range [1, 65535]")
+    return value
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Modbox containerization engine.")
     parser.add_argument("--memory-limit", type=int, default=50, help="Memory limit for the container in megabytes (MB).")
     parser.add_argument("--cpu-limit", type=float, default=0.5, help="CPU limit for the container as a percentage (e.g., 0.5 for 50%).")
     parser.add_argument("--pid-limit", type=int, default=32, help="Maximum number of processes allowed in the container.")
-    parser.add_argument("--port", action='append', help="Port mapping (e.g., host_port:container_port). Can be specified multiple times.")
+    parser.add_argument("--port", action='append', type=_port_mapping, help="Port mapping (e.g., host_port:container_port). Can be specified multiple times.")
     parser.add_argument("command", nargs=argparse.REMAINDER, help="Command to execute inside the container")
     return parser.parse_args()
 
