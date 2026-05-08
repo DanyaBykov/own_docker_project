@@ -25,11 +25,33 @@ echo "Done!"
 echo "Preparing DNS for package installation..."
 cp /etc/resolv.conf rootfs/etc/resolv.conf
 
-# minetest-server: headless server binary; minetest-mineclone2: the only game in Alpine repos
-# libseccomp: required by the host's seccomp filter (loaded via ctypes inside the chroot)
+# minetest-server: headless server binary; libseccomp: required by the host's seccomp filter
 # python3: required for running security tests inside the container
+# minetest-mineclone2 was dropped from Alpine 3.21 — fetched directly from ContentDB below
 echo "Installing packages..."
-chroot rootfs /bin/sh -c "apk update && apk add minetest-server minetest-mineclone2 libseccomp python3"
+chroot rootfs /bin/sh -c "apk update && apk add minetest-server libseccomp python3"
+
+MINECLONE2_ZIP="mineclone2-0.91.2.zip"
+MINECLONE2_URL="https://content.luanti.org/uploads/9f65a9135f.zip"
+MINECLONE2_DEST="rootfs/usr/share/minetest/games/mineclone2"
+
+echo "Downloading MineClone2 0.91.2..."
+if [ ! -f "$MINECLONE2_ZIP" ]; then
+    curl -L -o "$MINECLONE2_ZIP" "$MINECLONE2_URL"
+fi
+rm -rf "$MINECLONE2_DEST"
+mkdir -p "$(dirname "$MINECLONE2_DEST")"
+python3 - "$MINECLONE2_ZIP" "$MINECLONE2_DEST" <<'PYEOF'
+import zipfile, sys, os, shutil
+zip_path, dest = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(zip_path) as zf:
+    zf.extractall("/tmp/mc2_extract")
+entries = os.listdir("/tmp/mc2_extract")
+src = os.path.join("/tmp/mc2_extract", entries[0]) if len(entries) == 1 else "/tmp/mc2_extract"
+shutil.copytree(src, dest)
+shutil.rmtree("/tmp/mc2_extract")
+print(f"MineClone2 installed at {dest}")
+PYEOF
 
 echo "Copying test scripts into rootfs..."
 mkdir -p rootfs/src

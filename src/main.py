@@ -139,15 +139,15 @@ def _setup_networking_inner(pid, port_mappings, cleanup_cmds):
     # Block container from reaching host-local services directly.
     # Port-forwarded traffic uses PREROUTING DNAT → FORWARD, not INPUT.
     # However, we must allow return traffic for connections initiated by the host.
-    fwd_est = "iptables -I INPUT -i veth_host -m state --state ESTABLISHED,RELATED -j ACCEPT"
+    fwd_est = ["iptables", "-I", "INPUT", "-i", "veth_host", "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"]
     run_command(fwd_est)
-    cleanup_cmds.append(fwd_est.replace("-I", "-D"))
-    
+    cleanup_cmds.append(["iptables", "-D", "INPUT", "-i", "veth_host", "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"])
+
     # REJECT (not DROP) so nc inside the container gets an immediate RST rather
     # than waiting for the kernel's TCP retransmit timeout (~127 s).
-    reject_in = "iptables -A INPUT -i veth_host -s 172.18.0.0/24 -j REJECT"
+    reject_in = ["iptables", "-A", "INPUT", "-i", "veth_host", "-s", "172.18.0.0/24", "-j", "REJECT"]
     run_command(reject_in)
-    cleanup_cmds.append(reject_in.replace("-A", "-D"))
+    cleanup_cmds.append(["iptables", "-D", "INPUT", "-i", "veth_host", "-s", "172.18.0.0/24", "-j", "REJECT"])
 
 
 def cleanup_networking(cleanup_cmds):
@@ -291,6 +291,7 @@ def run_container(rootfs_path, command_args, memory_limit_mb, cpu_limit_percenta
         log("info", "Mounting proc, dev (minimal), tmp, var")
         subprocess.run(["mount", "-t", "proc", "proc", "/proc"], check=True)
         subprocess.run(["mount", "-t", "tmpfs", "tmpfs", "/dev"], check=True)
+        old_umask = os.umask(0)
         for name, major, minor, mode in [
             ("null",    1, 3, 0o666),
             ("zero",    1, 5, 0o666),
@@ -301,6 +302,7 @@ def run_container(rootfs_path, command_args, memory_limit_mb, cpu_limit_percenta
             ("console", 5, 1, 0o600),
         ]:
             os.mknod(f"/dev/{name}", mode | 0o020000, os.makedev(major, minor))
+        os.umask(old_umask)
         subprocess.run(["mount", "-t", "tmpfs", "tmpfs", "/tmp"], check=True)
         subprocess.run(["mount", "-t", "tmpfs", "tmpfs", "/var"], check=True)
         os.makedirs("/var/luanti/world/worldmods", exist_ok=True)

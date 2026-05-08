@@ -57,4 +57,5 @@ trap cleanup EXIT INT TERM
 
 chroot rootfs minetestserver \
     --config /etc/luanti.conf \
-    --world /var/luanti/world
+    --world /var/luanti/world \
+    --gameid mineclone2

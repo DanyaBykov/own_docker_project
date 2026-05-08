@@ -49,8 +49,7 @@ ALLOWED_SYSCALLS = [
     332, # statx
 
     # --- Memory ---
-    9,   # mmap
-    10,  # mprotect
+    # mmap (9) and mprotect (10) are handled with PROT_EXEC conditions in prepare_seccomp()
     11,  # munmap
     12,  # brk
     25,  # mremap
