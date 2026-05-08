@@ -20,6 +20,24 @@ echo ""
 rm -rf rootfs/usr/local/share/evilmod
 cp -r src/evil_mod rootfs/usr/local/share/evilmod
 
+rm -rf rootfs/usr/local/share/jit_disable
+cp -r src/jit_disable rootfs/usr/local/share/jit_disable
+
+# Prepend jit.off() to the earliest Lua hook so LuaJIT never attempts to
+# allocate its JIT arena (mmap RWX), which the seccomp W^X filter blocks.
+BUILTIN="rootfs/usr/share/minetest/builtin/init.lua"
+if ! grep -q "^jit\.off()" "$BUILTIN"; then
+    python3 - "$BUILTIN" <<'PYEOF'
+import sys
+path = sys.argv[1]
+with open(path) as f:
+    content = f.read()
+with open(path, 'w') as f:
+    f.write('jit.off()\n' + content)
+print("Patched builtin/init.lua with jit.off()")
+PYEOF
+fi
+
 # Disable weather cycling — irrelevant to the security probe demo.
 # Without this, weather changes every 10–150 minutes and clutters the output.
 if ! grep -q "mcl_doWeatherCycle" rootfs/etc/luanti.conf; then

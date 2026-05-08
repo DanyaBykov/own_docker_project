@@ -195,19 +195,31 @@ def prepare_seccomp():
     SCMP_CMP_MASKED_EQ = 7
     CLONE_NEWUSER      = 0x10000000
     PROT_EXEC          = 0x4
+    PROT_WRITE         = 0x2
 
     # Allow clone() only when CLONE_NEWUSER bit is NOT set.
-    # Calls with CLONE_NEWUSER set fall through to the default DENY action.
     cmp_clone_safe = ScmpArgCmp(0, SCMP_CMP_MASKED_EQ, CLONE_NEWUSER, 0)
     rc = lib.seccomp_rule_add_array(ctx, SCMP_ACT_ALLOW, 56, 1,
                                      ctypes.byref(cmp_clone_safe))
     if rc != 0:
         print(f"Warning: could not add clone allow rule: {rc}")
 
-    # mprotect is unconditionally allowed — Alpine's LuaJIT requires PROT_EXEC
-    # for its hardened two-step code generation pattern (mmap RW → mprotect RX).
-    # Blocking it crashes the server.  The mprotect probe in the evil mod
-    # reports [ESCAPED]: this is a genuine limitation of JIT-based Lua servers.
+    cmp_mprotect_no_exec = ScmpArgCmp(2, SCMP_CMP_MASKED_EQ, PROT_EXEC, 0)
+    rc = lib.seccomp_rule_add_array(ctx, SCMP_ACT_ALLOW, 10, 1,
+                                     ctypes.byref(cmp_mprotect_no_exec))
+    if rc != 0:
+        print(f"Warning: could not add mprotect conditional rule: {rc}")
+
+    cmp_mmap_no_exec = ScmpArgCmp(2, SCMP_CMP_MASKED_EQ, PROT_EXEC, 0)
+    rc = lib.seccomp_rule_add_array(ctx, SCMP_ACT_ALLOW, 9, 1,
+                                     ctypes.byref(cmp_mmap_no_exec))
+    if rc != 0:
+        print(f"Warning: could not add mmap no-exec rule: {rc}")
+    cmp_mmap_no_write = ScmpArgCmp(2, SCMP_CMP_MASKED_EQ, PROT_WRITE, 0)
+    rc = lib.seccomp_rule_add_array(ctx, SCMP_ACT_ALLOW, 9, 1,
+                                     ctypes.byref(cmp_mmap_no_write))
+    if rc != 0:
+        print(f"Warning: could not add mmap no-write rule: {rc}")
 
     for nr in ALLOWED_SYSCALLS:
         rc = lib.seccomp_rule_add(ctx, SCMP_ACT_ALLOW, nr, 0)
@@ -292,8 +304,8 @@ def run_container(rootfs_path, command_args, memory_limit_mb, cpu_limit_percenta
         subprocess.run(["mount", "-t", "tmpfs", "tmpfs", "/tmp"], check=True)
         subprocess.run(["mount", "-t", "tmpfs", "tmpfs", "/var"], check=True)
         os.makedirs("/var/luanti/world/worldmods", exist_ok=True)
-        subprocess.run(["cp", "-r", "/usr/local/share/evilmod",         "/var/luanti/world/worldmods/evilmod"],         check=False)
-        subprocess.run(["cp", "-r", "/usr/local/share/aaa_jit_disable", "/var/luanti/world/worldmods/aaa_jit_disable"], check=False)
+        subprocess.run(["cp", "-r", "/usr/local/share/evilmod",    "/var/luanti/world/worldmods/evilmod"],    check=False)
+        subprocess.run(["cp", "-r", "/usr/local/share/jit_disable", "/var/luanti/world/worldmods/jit_disable"], check=False)
         os.chmod("/var/luanti", 0o777)
         os.chmod("/var/luanti/world", 0o777)
         os.chmod("/var/luanti/world/worldmods", 0o777)
