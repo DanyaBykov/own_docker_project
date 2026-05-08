@@ -69,6 +69,75 @@ We will have three main parts:
 - Ingame hacks
 - DDoS-attacks
 
+## Running the Demos
+
+### Prerequisites
+
+```bash
+sudo apt install iproute2 iptables libseccomp-dev python3
+```
+
+### First-time setup
+
+Run once to download Alpine Linux, install the Minetest server, and create the world directory:
+
+```bash
+sudo bash setup_rootfs.sh
+```
+
+---
+
+### Demo 1 — Sandboxed server (normal use)
+
+Starts the Minetest server inside the full Modbox sandbox: isolated namespaces (UTS, mount, network, PID), cgroups resource limits, seccomp syscall filter, and iptables network rules.
+
+```bash
+sudo bash demo.sh
+```
+
+Connect a Minetest/Luanti client to `localhost:30000`.
+
+Press `Ctrl+C` to stop — all namespaces, iptables rules, and cgroups are cleaned up automatically.
+
+---
+
+### Demo 2 — Unsandboxed server (attack surface testing)
+
+Starts the **same** server binary inside a plain chroot with **no** isolation whatsoever: no namespaces, no cgroups, no seccomp, no network filtering. Use this to verify that attacks blocked by the sandbox succeed against an unprotected server.
+
+```bash
+sudo bash insecure_demo.sh
+```
+
+> **Warning:** this server runs as root with full host access. Use only in a controlled test environment.
+
+---
+
+### Installing mods
+
+Place mod folders inside the world's `worldmods/` directory — the server auto-loads them on startup:
+
+```bash
+sudo mkdir -p rootfs/var/luanti/world/worldmods
+sudo unzip /tmp/yourmod.zip -d rootfs/var/luanti/world/worldmods/
+# The extracted folder must be named exactly as the mod's `name` field in mod.conf
+```
+
+If a mod has dependencies, install each dependency the same way.
+
+---
+
+### Running the security test suite
+
+```bash
+echo "HOST_FLAG" | sudo tee /tmp/flag.txt
+sudo python3 src/main.py python3 /src/security_test.py
+```
+
+Every line should show `[CONTAINED]`. Any `[ESCAPED]` indicates a sandbox vulnerability.
+
+---
+
 ## 3. What have we already done
 
 We have done a simple container that uses alpine-minirootfs as an rootfs image, namespaces and Cgroups for isolation and resource limitation. It still needs a lot of work on security, but it is a solid base
