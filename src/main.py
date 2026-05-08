@@ -309,8 +309,8 @@ def run_container(rootfs_path, command_args, memory_limit_mb, cpu_limit_percenta
         os.umask(old_umask)
 
         subprocess.run(["mount", "-t", "tmpfs", "tmpfs", "/tmp"], check=True)
-        subprocess.run(["mount", "-t", "tmpfs", "tmpfs", "/var"], check=True)
         os.makedirs("/var/luanti/world/worldmods", exist_ok=True)
+        subprocess.run(["mount", "--bind", "/var/luanti", "/var/luanti"], check=True)
         subprocess.run(["cp", "-r", "/usr/local/share/evilmod",    "/var/luanti/world/worldmods/evilmod"],    check=False)
         subprocess.run(["cp", "-r", "/usr/local/share/jit_disable", "/var/luanti/world/worldmods/jit_disable"], check=False)
         for path in ["/var/luanti", "/var/luanti/world", "/var/luanti/world/worldmods"]:
