@@ -4,6 +4,7 @@ import socket
 import argparse
 import subprocess
 import ctypes
+from syscalls import ALLOWED_SYSCALLS
 
 _C = {
     "reset":  "\033[0m",
@@ -133,130 +134,6 @@ def cleanup_networking(cleanup_cmds):
 def setup_seccomp():
     SCMP_ACT_ERRNO_EPERM = 0x00050001
     SCMP_ACT_ALLOW       = 0x7fff0000
-    ALLOWED_SYSCALLS = [
-        0,   # read
-        1,   # write
-        2,   # open
-        3,   # close
-        4,   # stat
-        5,   # fstat
-        6,   # lstat
-        7,   # poll
-        8,   # lseek
-        9,   # mmap
-        10,  # mprotect
-        11,  # munmap
-        12,  # brk
-        13,  # rt_sigaction
-        14,  # rt_sigprocmask
-        16,  # ioctl
-        17,  # pread64
-        18,  # pwrite64
-        19,  # readv
-        20,  # writev
-        21,  # access
-        22,  # pipe
-        23,  # select
-        24,  # sched_yield
-        25,  # mremap
-        28,  # madvise
-        32,  # dup
-        33,  # dup2
-        35,  # nanosleep
-        39,  # getpid
-        41,  # socket
-        42,  # connect
-        43,  # accept
-        44,  # sendto
-        45,  # recvfrom
-        46,  # sendmsg
-        47,  # recvmsg
-        48,  # shutdown
-        49,  # bind
-        50,  # listen
-        51,  # getsockname
-        52,  # getpeername
-        54,  # setsockopt
-        55,  # getsockopt
-        56,  # clone
-        57,  # fork
-        58,  # vfork
-        59,  # execve
-        60,  # exit
-        61,  # wait4
-        63,  # uname
-        72,  # fcntl
-        73,  # flock
-        74,  # fsync
-        75,  # fdatasync
-        76,  # truncate
-        77,  # ftruncate
-        78,  # getdents
-        79,  # getcwd
-        80,  # chdir
-        82,  # rename
-        83,  # mkdir
-        84,  # rmdir
-        85,  # creat
-        86,  # link
-        87,  # unlink
-        88,  # symlink
-        89,  # readlink
-        90,  # chmod
-        91,  # fchmod
-        95,  # umask
-        96,  # gettimeofday
-        97,  # getrlimit
-        99,  # sysinfo
-        100, # times
-        102, # getuid
-        104, # getgid
-        105, # setuid
-        106, # setgid
-        107, # geteuid
-        108, # getegid
-        110, # getppid
-        111, # getpgrp
-        112, # setsid
-        113, # setreuid
-        114, # setregid
-        116, # setgroups
-        117, # setresuid
-        119, # setresgid
-        128, # rt_sigreturn
-        131, # sigaltstack
-        157, # prctl
-        158, # arch_prctl
-        186, # gettid
-        202, # futex
-        217, # getdents64
-        218, # set_tid_address
-        221, # fadvise64
-        228, # clock_gettime
-        230, # clock_nanosleep
-        231, # exit_group
-        232, # epoll_wait
-        233, # epoll_ctl
-        234, # tgkill
-        247, # waitid
-        257, # openat
-        262, # newfstatat
-        267, # readlinkat
-        270, # pselect6
-        273, # set_robust_list
-        274, # get_robust_list
-        277, # sync_file_range
-        281, # epoll_pwait
-        285, # fallocate
-        291, # epoll_create1
-        293, # pipe2
-        299, # recvmmsg
-        302, # prlimit64
-        307, # sendmmsg
-        318, # getrandom
-        332, # statx
-        334, # rseq
-    ]
 
     try:
         lib = ctypes.CDLL("libseccomp.so.2", use_errno=True)
