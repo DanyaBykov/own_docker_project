@@ -1,8 +1,5 @@
 #!/bin/bash
 # Unsandboxed server — for attack surface comparison tests only.
-# NO namespaces, NO cgroups, NO seccomp, NO network isolation.
-# The server runs as root inside a plain chroot.
-# DO NOT use this in production.
 
 set -e
 

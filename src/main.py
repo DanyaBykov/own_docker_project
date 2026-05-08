@@ -5,7 +5,6 @@ import argparse
 import subprocess
 import ctypes
 
-# ANSI color codes
 _C = {
     "reset":  "\033[0m",
     "cmd":    "\033[2m",    # dim — shell commands
@@ -63,7 +62,6 @@ def cleanup_cgroups(pid):
 def setup_networking(pid, port_mappings):
     cleanup_cmds = []
 
-    # Delete any leftover veth from a previous crashed run — safe to ignore failure.
     subprocess.run(["ip", "link", "del", "veth_host"], stderr=subprocess.DEVNULL)
 
     try:
@@ -81,7 +79,6 @@ def _setup_networking_inner(pid, port_mappings, cleanup_cmds):
     default_iface = parts[parts.index("dev") + 1]
     log("net", f"Default interface: {default_iface} — creating veth pair for PID {pid}")
 
-    # #9: Save original ip_forward value and restore it on cleanup instead of hardcoding 0.
     orig_ip_forward = subprocess.check_output(["sysctl", "-n", "net.ipv4.ip_forward"], text=True).strip()
     run_command(["sysctl", "-w", "net.ipv4.ip_forward=1"])
     cleanup_cmds.append(["sysctl", "-w", f"net.ipv4.ip_forward={orig_ip_forward}"])
@@ -96,22 +93,16 @@ def _setup_networking_inner(pid, port_mappings, cleanup_cmds):
     run_command(["iptables", "-t", "nat", "-A", "POSTROUTING", "-s", "172.18.0.0/24", "-o", default_iface, "-j", "MASQUERADE"])
     cleanup_cmds.append(["iptables", "-t", "nat", "-D", "POSTROUTING", "-s", "172.18.0.0/24", "-o", default_iface, "-j", "MASQUERADE"])
 
-    # MASQUERADE traffic going into the container so its responses route back via
-    # veth_host rather than trying to reach 127.0.0.1 through a non-loopback path.
     run_command(["iptables", "-t", "nat", "-A", "POSTROUTING", "-d", "172.18.0.0/24", "-j", "MASQUERADE"])
     cleanup_cmds.append(["iptables", "-t", "nat", "-D", "POSTROUTING", "-d", "172.18.0.0/24", "-j", "MASQUERADE"])
 
-    # #5: Set route_localnet per-interface on veth_host (not global via `all`).
-    # No cleanup entry needed: veth_host deletion clears the per-iface sysctl automatically.
     run_command(["sysctl", "-w", "net.ipv4.conf.veth_host.route_localnet=1"])
 
-    # #12: Scope ESTABLISHED/RELATED rules to veth_host instead of being host-wide.
     run_command(["iptables", "-A", "FORWARD", "-i", "veth_host", "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"])
     cleanup_cmds.append(["iptables", "-D", "FORWARD", "-i", "veth_host", "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"])
     run_command(["iptables", "-A", "FORWARD", "-o", "veth_host", "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"])
     cleanup_cmds.append(["iptables", "-D", "FORWARD", "-o", "veth_host", "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"])
 
-    # #12: Scope DNS rules to veth_host (traffic FROM container going outbound).
     run_command(["iptables", "-A", "FORWARD", "-i", "veth_host", "-s", "172.18.0.0/24", "-p", "udp", "--dport", "53", "-j", "ACCEPT"])
     cleanup_cmds.append(["iptables", "-D", "FORWARD", "-i", "veth_host", "-s", "172.18.0.0/24", "-p", "udp", "--dport", "53", "-j", "ACCEPT"])
     run_command(["iptables", "-A", "FORWARD", "-i", "veth_host", "-s", "172.18.0.0/24", "-p", "tcp", "--dport", "53", "-j", "ACCEPT"])
@@ -120,17 +111,13 @@ def _setup_networking_inner(pid, port_mappings, cleanup_cmds):
     for mapping in port_mappings:
         host_port, container_port = mapping.split(":")
         for proto in ("tcp", "udp"):
-            # PREROUTING: packets arriving on a real interface
             run_command(["iptables", "-t", "nat", "-A", "PREROUTING", "-p", proto, "--dport", host_port, "-j", "DNAT", "--to-destination", f"172.18.0.2:{container_port}"])
             cleanup_cmds.append(["iptables", "-t", "nat", "-D", "PREROUTING", "-p", proto, "--dport", host_port, "-j", "DNAT", "--to-destination", f"172.18.0.2:{container_port}"])
-            # OUTPUT: packets from localhost connecting to localhost:host_port
             run_command(["iptables", "-t", "nat", "-A", "OUTPUT", "-p", proto, "-d", "127.0.0.1", "--dport", host_port, "-j", "DNAT", "--to-destination", f"172.18.0.2:{container_port}"])
             cleanup_cmds.append(["iptables", "-t", "nat", "-D", "OUTPUT", "-p", proto, "-d", "127.0.0.1", "--dport", host_port, "-j", "DNAT", "--to-destination", f"172.18.0.2:{container_port}"])
-            # #12: FORWARD inbound scoped to veth_host with -o veth_host.
             run_command(["iptables", "-A", "FORWARD", "-o", "veth_host", "-d", "172.18.0.0/24", "-p", proto, "--dport", container_port, "-j", "ACCEPT"])
             cleanup_cmds.append(["iptables", "-D", "FORWARD", "-o", "veth_host", "-d", "172.18.0.0/24", "-p", proto, "--dport", container_port, "-j", "ACCEPT"])
 
-    # #12: Scope DROP rule to veth_host with -i veth_host.
     run_command(["iptables", "-A", "FORWARD", "-i", "veth_host", "-s", "172.18.0.0/24", "-j", "DROP"])
     cleanup_cmds.append(["iptables", "-D", "FORWARD", "-i", "veth_host", "-s", "172.18.0.0/24", "-j", "DROP"])
 
@@ -146,8 +133,6 @@ def cleanup_networking(cleanup_cmds):
 def setup_seccomp():
     SCMP_ACT_ERRNO_EPERM = 0x00050001
     SCMP_ACT_ALLOW       = 0x7fff0000
-
-    # syscall numbers for x86_64 Linux
     ALLOWED_SYSCALLS = [
         0,   # read
         1,   # write
@@ -332,19 +317,12 @@ def run_container(rootfs_path, command_args, memory_limit_mb, cpu_limit_percenta
             os.close(r_fd)
             os.close(w_fd)
 
-        # unshare(CLONE_NEWPID) does NOT move the calling process into the new
-        # namespace — its next fork child becomes PID 1. We must fork here before
-        # any further subprocess.run calls, otherwise those short-lived subprocesses
-        # become PID 1 and their exit tears down the namespace (ENOMEM on next fork).
         log("sec", "Creating PID namespace (double-fork)")
         os.unshare(os.CLONE_NEWPID)
         grandchild = os.fork()
         if grandchild != 0:
-            # Intermediate process: reaper for the PID namespace.
             _, status = os.waitpid(grandchild, 0)
             sys.exit(os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1)
-
-        # --- Grandchild: PID 1 in the new PID namespace ---
         log("sec", f"Container init started (PID 1 in namespace, host PID {os.getpid()})")
         log("info", f"Chrooting into {rootfs_path}")
         os.chdir(rootfs_path)
