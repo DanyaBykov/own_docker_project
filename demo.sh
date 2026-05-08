@@ -23,8 +23,6 @@ cp -r src/evil_mod rootfs/usr/local/share/evilmod
 rm -rf rootfs/usr/local/share/jit_disable
 cp -r src/jit_disable rootfs/usr/local/share/jit_disable
 
-# Prepend jit.off() to the earliest Lua hook so LuaJIT never attempts to
-# allocate its JIT arena (mmap RWX), which the seccomp W^X filter blocks.
 BUILTIN="rootfs/usr/share/minetest/builtin/init.lua"
 if ! grep -q "^jit\.off()" "$BUILTIN"; then
     python3 - "$BUILTIN" <<'PYEOF'
@@ -38,8 +36,6 @@ print("Patched builtin/init.lua with jit.off()")
 PYEOF
 fi
 
-# Disable weather cycling — irrelevant to the security probe demo.
-# Without this, weather changes every 10–150 minutes and clutters the output.
 if ! grep -q "mcl_doWeatherCycle" rootfs/etc/luanti.conf; then
     echo "mcl_doWeatherCycle = false" >> rootfs/etc/luanti.conf
 fi
@@ -47,9 +43,6 @@ if ! grep -q "time_speed" rootfs/etc/luanti.conf; then
     echo "time_speed = 0" >> rootfs/etc/luanti.conf
 fi
 
-# Fix weather_core.lua: set_random_weather didn't update end_time when no
-# transition matched (roll==100 for a <100 boundary), causing a 5-second
-# tight retry loop.  Patch idempotently — skip if already applied.
 WC="rootfs/usr/share/minetest/games/mineclone2/mods/ENVIRONMENT/mcl_weather/weather_core.lua"
 if grep -q "if new_weather then" "$WC" && ! grep -q "No transition matched" "$WC"; then
     python3 - "$WC" <<'PYEOF'

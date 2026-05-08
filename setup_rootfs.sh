@@ -19,15 +19,11 @@ echo "${ALPINE_SHA256}  ${ALPINE_TARBALL}" | sha256sum -c -
 echo "Extracting rootfs..."
 rm -rf rootfs/*
 tar -xzf "$ALPINE_TARBALL" -C rootfs
-
 echo "Done!"
 
 echo "Preparing DNS for package installation..."
 cp /etc/resolv.conf rootfs/etc/resolv.conf
 
-# minetest-server: headless server binary; libseccomp: required by the host's seccomp filter
-# python3: required for running security tests inside the container
-# minetest-mineclone2 was dropped from Alpine 3.21 — fetched directly from ContentDB below
 echo "Installing packages..."
 chroot rootfs /bin/sh -c "apk update && apk add minetest-server libseccomp python3"
 
@@ -39,6 +35,7 @@ echo "Downloading MineClone2 0.91.2..."
 if [ ! -f "$MINECLONE2_ZIP" ]; then
     curl -L -o "$MINECLONE2_ZIP" "$MINECLONE2_URL"
 fi
+
 rm -rf "$MINECLONE2_DEST"
 mkdir -p "$(dirname "$MINECLONE2_DEST")"
 python3 - "$MINECLONE2_ZIP" "$MINECLONE2_DEST" <<'PYEOF'
@@ -59,7 +56,6 @@ cp src/security_test.py rootfs/src/security_test.py
 cp src/stress.py rootfs/src/stress.py
 
 echo "Creating server config and staging evil mod..."
-
 cat > rootfs/etc/luanti.conf << 'EOF'
 port = 30000
 bind_address = 0.0.0.0
@@ -75,8 +71,6 @@ mcl_doWeatherCycle = false
 time_speed = 0
 EOF
 
-# Fix weather_core.lua: set_random_weather didn't update end_time when no
-# transition matched, causing a 5-second tight retry loop.
 WC="rootfs/usr/share/minetest/games/mineclone2/mods/ENVIRONMENT/mcl_weather/weather_core.lua"
 python3 - "$WC" <<'PYEOF'
 import sys
@@ -113,8 +107,6 @@ cp -r src/evil_mod rootfs/usr/local/share/evilmod
 rm -rf rootfs/usr/local/share/jit_disable
 cp -r src/jit_disable rootfs/usr/local/share/jit_disable
 
-# Prepend jit.off() to the earliest Lua hook so LuaJIT never attempts to
-# allocate its JIT arena (mmap RWX), which the seccomp W^X filter blocks.
 BUILTIN="rootfs/usr/share/minetest/builtin/init.lua"
 if ! grep -q "^jit\.off()" "$BUILTIN"; then
     python3 - "$BUILTIN" <<'PYEOF'
