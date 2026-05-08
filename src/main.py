@@ -276,13 +276,21 @@ def run_container(rootfs_path, command_args, memory_limit_mb, cpu_limit_percenta
             sys.exit(os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1)
 
         log("sec", f"Container init started (PID 1 in namespace, host PID {os.getpid()})")
-        log("sec", "Preparing seccomp filter (host libseccomp, before chroot)")
+        log("sec", "Preparing seccomp filter (host libseccomp, before pivot_root)")
         seccomp_lib, seccomp_ctx = prepare_seccomp()
 
-        log("info", f"Chrooting into {rootfs_path}")
+        log("info", f"Pivoting root into {rootfs_path}")
+        subprocess.run(["mount", "--make-rprivate", "/"], check=True)
+        subprocess.run(["mount", "--bind", rootfs_path, rootfs_path], check=True)
+        subprocess.run(["mount", "--make-private", rootfs_path], check=True)
         os.chdir(rootfs_path)
-        os.chroot(".")
+        os.makedirs(".old_root", exist_ok=True)
+        _libc = ctypes.CDLL(None, use_errno=True)
+        if _libc.syscall(ctypes.c_long(155), b".", b".old_root") != 0:
+            sys.exit(f"Error: pivot_root failed: {os.strerror(ctypes.get_errno())}")
         os.chdir("/")
+        subprocess.run(["umount", "-l", "/.old_root"], check=True)
+        os.rmdir("/.old_root")
 
         log("info", "Mounting proc, dev (minimal), tmp, var")
         subprocess.run(["mount", "-t", "proc", "proc", "/proc"], check=True)
@@ -305,9 +313,11 @@ def run_container(rootfs_path, command_args, memory_limit_mb, cpu_limit_percenta
         os.makedirs("/var/luanti/world/worldmods", exist_ok=True)
         subprocess.run(["cp", "-r", "/usr/local/share/evilmod",    "/var/luanti/world/worldmods/evilmod"],    check=False)
         subprocess.run(["cp", "-r", "/usr/local/share/jit_disable", "/var/luanti/world/worldmods/jit_disable"], check=False)
-        os.chmod("/var/luanti", 0o777)
-        os.chmod("/var/luanti/world", 0o777)
-        os.chmod("/var/luanti/world/worldmods", 0o777)
+        for path in ["/var/luanti", "/var/luanti/world", "/var/luanti/world/worldmods"]:
+            os.chown(path, 65534, 65534)
+            os.chmod(path, 0o755)
+
+        subprocess.run(["mount", "-o", "remount,ro,bind", "/"], check=True)
 
         log("sec", "Dropping privileges → UID/GID 65534 (nobody), groups cleared")
         os.setgroups([])
