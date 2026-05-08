@@ -6,8 +6,8 @@ import subprocess
 import ctypes
 
 def run_command(cmd):
-    print(f"Executing: {cmd}")
-    subprocess.run(cmd, shell=True, check=True)
+    print(f"Executing: {' '.join(cmd)}")
+    subprocess.run(cmd, check=True)
 
 def setup_cgroups(pid, memory_limit_mb, cpu_percentage, pid_limit):
     cg_path = f"/sys/fs/cgroup/sandbox_{pid}"
@@ -45,7 +45,7 @@ def setup_networking(pid, port_mappings):
     cleanup_cmds = []
 
     # Delete any leftover veth from a previous crashed run — safe to ignore failure.
-    subprocess.run("ip link del veth_host", shell=True, stderr=subprocess.DEVNULL)
+    subprocess.run(["ip", "link", "del", "veth_host"], stderr=subprocess.DEVNULL)
 
     try:
         _setup_networking_inner(pid, port_mappings, cleanup_cmds)
@@ -57,60 +57,62 @@ def setup_networking(pid, port_mappings):
 
 
 def _setup_networking_inner(pid, port_mappings, cleanup_cmds):
-    default_iface = subprocess.check_output("ip route | grep '^default' | awk '{print $5}'", shell=True).decode().strip()
+    result = subprocess.check_output(["ip", "-o", "route", "show", "default"], text=True).strip()
+    parts = result.split()
+    default_iface = parts[parts.index("dev") + 1]
 
-    run_command("sysctl -w net.ipv4.ip_forward=1")
-    cleanup_cmds.append("sysctl -w net.ipv4.ip_forward=0")
+    # #9: Save original ip_forward value and restore it on cleanup instead of hardcoding 0.
+    orig_ip_forward = subprocess.check_output(["sysctl", "-n", "net.ipv4.ip_forward"], text=True).strip()
+    run_command(["sysctl", "-w", "net.ipv4.ip_forward=1"])
+    cleanup_cmds.append(["sysctl", "-w", f"net.ipv4.ip_forward={orig_ip_forward}"])
 
-    run_command("ip link add veth_host type veth peer name veth_container")
-    cleanup_cmds.append("ip link del veth_host")
-    
-    run_command("ip link set veth_host up")
-    run_command("ip addr add 172.18.0.1/24 dev veth_host")
-    run_command(f"ip link set veth_container netns {pid}")
-    
-    nat_rule = f"iptables -t nat -A POSTROUTING -s 172.18.0.0/24 -o {default_iface} -j MASQUERADE"
-    run_command(nat_rule)
-    cleanup_cmds.append(nat_rule.replace("-A", "-D"))
+    run_command(["ip", "link", "add", "veth_host", "type", "veth", "peer", "name", "veth_container"])
+    cleanup_cmds.append(["ip", "link", "del", "veth_host"])
+
+    run_command(["ip", "link", "set", "veth_host", "up"])
+    run_command(["ip", "addr", "add", "172.18.0.1/24", "dev", "veth_host"])
+    run_command(["ip", "link", "set", "veth_container", "netns", str(pid)])
+
+    run_command(["iptables", "-t", "nat", "-A", "POSTROUTING", "-s", "172.18.0.0/24", "-o", default_iface, "-j", "MASQUERADE"])
+    cleanup_cmds.append(["iptables", "-t", "nat", "-D", "POSTROUTING", "-s", "172.18.0.0/24", "-o", default_iface, "-j", "MASQUERADE"])
 
     # MASQUERADE traffic going into the container so its responses route back via
     # veth_host rather than trying to reach 127.0.0.1 through a non-loopback path.
-    run_command("iptables -t nat -A POSTROUTING -d 172.18.0.0/24 -j MASQUERADE")
-    cleanup_cmds.append("iptables -t nat -D POSTROUTING -d 172.18.0.0/24 -j MASQUERADE")
+    run_command(["iptables", "-t", "nat", "-A", "POSTROUTING", "-d", "172.18.0.0/24", "-j", "MASQUERADE"])
+    cleanup_cmds.append(["iptables", "-t", "nat", "-D", "POSTROUTING", "-d", "172.18.0.0/24", "-j", "MASQUERADE"])
 
-    # Allow the kernel to route loopback-addressed packets through veth interfaces.
-    run_command("sysctl -w net.ipv4.conf.all.route_localnet=1")
-    cleanup_cmds.append("sysctl -w net.ipv4.conf.all.route_localnet=0")
+    # #5: Set route_localnet per-interface on veth_host (not global via `all`).
+    # No cleanup entry needed: veth_host deletion clears the per-iface sysctl automatically.
+    run_command(["sysctl", "-w", "net.ipv4.conf.veth_host.route_localnet=1"])
 
-    # Allow return traffic for established connections
-    run_command("iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT")
-    cleanup_cmds.append("iptables -D FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT")
+    # #12: Scope ESTABLISHED/RELATED rules to veth_host instead of being host-wide.
+    run_command(["iptables", "-A", "FORWARD", "-i", "veth_host", "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"])
+    cleanup_cmds.append(["iptables", "-D", "FORWARD", "-i", "veth_host", "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"])
+    run_command(["iptables", "-A", "FORWARD", "-o", "veth_host", "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"])
+    cleanup_cmds.append(["iptables", "-D", "FORWARD", "-o", "veth_host", "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"])
 
-    # Allow DNS outbound so the server can resolve hostnames
-    run_command("iptables -A FORWARD -s 172.18.0.0/24 -p udp --dport 53 -j ACCEPT")
-    cleanup_cmds.append("iptables -D FORWARD -s 172.18.0.0/24 -p udp --dport 53 -j ACCEPT")
-    run_command("iptables -A FORWARD -s 172.18.0.0/24 -p tcp --dport 53 -j ACCEPT")
-    cleanup_cmds.append("iptables -D FORWARD -s 172.18.0.0/24 -p tcp --dport 53 -j ACCEPT")
+    # #12: Scope DNS rules to veth_host (traffic FROM container going outbound).
+    run_command(["iptables", "-A", "FORWARD", "-i", "veth_host", "-s", "172.18.0.0/24", "-p", "udp", "--dport", "53", "-j", "ACCEPT"])
+    cleanup_cmds.append(["iptables", "-D", "FORWARD", "-i", "veth_host", "-s", "172.18.0.0/24", "-p", "udp", "--dport", "53", "-j", "ACCEPT"])
+    run_command(["iptables", "-A", "FORWARD", "-i", "veth_host", "-s", "172.18.0.0/24", "-p", "tcp", "--dport", "53", "-j", "ACCEPT"])
+    cleanup_cmds.append(["iptables", "-D", "FORWARD", "-i", "veth_host", "-s", "172.18.0.0/24", "-p", "tcp", "--dport", "53", "-j", "ACCEPT"])
 
     for mapping in port_mappings:
         host_port, container_port = mapping.split(":")
         for proto in ("tcp", "udp"):
             # PREROUTING: packets arriving on a real interface
-            dnat_pre = f"iptables -t nat -A PREROUTING -p {proto} --dport {host_port} -j DNAT --to-destination 172.18.0.2:{container_port}"
-            run_command(dnat_pre)
-            cleanup_cmds.append(dnat_pre.replace("-A", "-D"))
+            run_command(["iptables", "-t", "nat", "-A", "PREROUTING", "-p", proto, "--dport", host_port, "-j", "DNAT", "--to-destination", f"172.18.0.2:{container_port}"])
+            cleanup_cmds.append(["iptables", "-t", "nat", "-D", "PREROUTING", "-p", proto, "--dport", host_port, "-j", "DNAT", "--to-destination", f"172.18.0.2:{container_port}"])
             # OUTPUT: packets from localhost connecting to localhost:host_port
-            dnat_out = f"iptables -t nat -A OUTPUT -p {proto} -d 127.0.0.1 --dport {host_port} -j DNAT --to-destination 172.18.0.2:{container_port}"
-            run_command(dnat_out)
-            cleanup_cmds.append(dnat_out.replace("-A", "-D"))
-            # FORWARD inbound: traffic arriving at the container after DNAT
-            fwd_in = f"iptables -A FORWARD -d 172.18.0.0/24 -p {proto} --dport {container_port} -j ACCEPT"
-            run_command(fwd_in)
-            cleanup_cmds.append(fwd_in.replace("-A", "-D"))
+            run_command(["iptables", "-t", "nat", "-A", "OUTPUT", "-p", proto, "-d", "127.0.0.1", "--dport", host_port, "-j", "DNAT", "--to-destination", f"172.18.0.2:{container_port}"])
+            cleanup_cmds.append(["iptables", "-t", "nat", "-D", "OUTPUT", "-p", proto, "-d", "127.0.0.1", "--dport", host_port, "-j", "DNAT", "--to-destination", f"172.18.0.2:{container_port}"])
+            # #12: FORWARD inbound scoped to veth_host with -o veth_host.
+            run_command(["iptables", "-A", "FORWARD", "-o", "veth_host", "-d", "172.18.0.0/24", "-p", proto, "--dport", container_port, "-j", "ACCEPT"])
+            cleanup_cmds.append(["iptables", "-D", "FORWARD", "-o", "veth_host", "-d", "172.18.0.0/24", "-p", proto, "--dport", container_port, "-j", "ACCEPT"])
 
-    # Drop all other outbound traffic from the container
-    run_command("iptables -A FORWARD -s 172.18.0.0/24 -j DROP")
-    cleanup_cmds.append("iptables -D FORWARD -s 172.18.0.0/24 -j DROP")
+    # #12: Scope DROP rule to veth_host with -i veth_host.
+    run_command(["iptables", "-A", "FORWARD", "-i", "veth_host", "-s", "172.18.0.0/24", "-j", "DROP"])
+    cleanup_cmds.append(["iptables", "-D", "FORWARD", "-i", "veth_host", "-s", "172.18.0.0/24", "-j", "DROP"])
 
 
 def cleanup_networking(cleanup_cmds):
@@ -133,6 +135,7 @@ def setup_seccomp():
         4,   # stat
         5,   # fstat
         6,   # lstat
+        7,   # poll
         8,   # lseek
         9,   # mmap
         10,  # mprotect
@@ -140,16 +143,20 @@ def setup_seccomp():
         12,  # brk
         13,  # rt_sigaction
         14,  # rt_sigprocmask
+        16,  # ioctl
         17,  # pread64
         18,  # pwrite64
         19,  # readv
         20,  # writev
         21,  # access
+        22,  # pipe
         23,  # select
         24,  # sched_yield
+        25,  # mremap
         28,  # madvise
         32,  # dup
         33,  # dup2
+        35,  # nanosleep
         39,  # getpid
         41,  # socket
         42,  # connect
@@ -168,6 +175,7 @@ def setup_seccomp():
         56,  # clone
         57,  # fork
         58,  # vfork
+        59,  # execve
         60,  # exit
         61,  # wait4
         63,  # uname
@@ -200,28 +208,42 @@ def setup_seccomp():
         111, # getpgrp
         112, # setsid
         128, # rt_sigreturn
+        131, # sigaltstack
+        157, # prctl
         158, # arch_prctl
         186, # gettid
         202, # futex
+        217, # getdents64
         218, # set_tid_address
+        221, # fadvise64
         228, # clock_gettime
+        230, # clock_nanosleep
         231, # exit_group
+        232, # epoll_wait
+        233, # epoll_ctl
+        234, # tgkill
+        247, # waitid
         257, # openat
         262, # newfstatat
         267, # readlinkat
+        270, # pselect6
         273, # set_robust_list
         274, # get_robust_list
+        281, # epoll_pwait
+        291, # epoll_create1
         293, # pipe2
+        299, # recvmmsg
         302, # prlimit64
+        307, # sendmmsg
         318, # getrandom
+        332, # statx
         334, # rseq
     ]
 
     try:
         lib = ctypes.CDLL("libseccomp.so.2", use_errno=True)
     except OSError as e:
-        print(f"Warning: could not load libseccomp, skipping seccomp filter: {e}")
-        return
+        sys.exit(f"Error: seccomp filter failed to load: could not load libseccomp: {e}")
 
     lib.seccomp_init.restype = ctypes.c_void_p
     lib.seccomp_init.argtypes = [ctypes.c_uint32]
@@ -234,8 +256,7 @@ def setup_seccomp():
 
     ctx = lib.seccomp_init(SCMP_ACT_ERRNO_EPERM)
     if not ctx:
-        print("Warning: seccomp_init returned NULL, skipping seccomp filter")
-        return
+        sys.exit("Error: seccomp filter failed to load: seccomp_init returned NULL")
 
     for nr in ALLOWED_SYSCALLS:
         rc = lib.seccomp_rule_add(ctx, SCMP_ACT_ALLOW, nr, 0)
@@ -244,9 +265,8 @@ def setup_seccomp():
 
     rc = lib.seccomp_load(ctx)
     if rc != 0:
-        print(f"Warning: seccomp_load failed: {rc}. Continuing without seccomp.")
-    else:
-        print("Seccomp filter loaded.")
+        sys.exit(f"Error: seccomp filter failed to load: seccomp_load returned {rc}")
+    print("Seccomp filter loaded.")
 
     lib.seccomp_release(ctx)
 
@@ -261,37 +281,58 @@ def run_container(rootfs_path, command_args, memory_limit_mb, cpu_limit_percenta
         # Create isolated namespaces in the child so the parent's subprocesses
         # (ip, iptables, sysctl) stay in the host namespaces and can see the
         # child's PID when setting up the veth pair.
-        os.unshare(os.CLONE_NEWUTS | os.CLONE_NEWNS)
+        os.unshare(os.CLONE_NEWUTS | os.CLONE_NEWNS | os.CLONE_NEWPID)
         # Prevent mount events from propagating back to the host namespace.
         # Without this, mounts inside the container leak into the host's /dev.
-        os.system("mount --make-rprivate /")
+        subprocess.run(["mount", "--make-rprivate", "/"], check=True)
         socket.sethostname("sandbox")
         os.chdir(rootfs_path)
         os.chroot(".")
         os.chdir("/")
-        os.system("mount -t proc proc /proc")
-        os.system("mount -t devtmpfs devtmpfs /dev")
-        os.system("mount -t tmpfs tmpfs /tmp")
-        os.system("mkdir -p /var/luanti/world")
-        os.system("chmod 777 /var/luanti /var/luanti/world")
-        
+        subprocess.run(["mount", "-t", "proc", "proc", "/proc"], check=True)
+        subprocess.run(["mount", "-t", "tmpfs", "tmpfs", "/dev"], check=True)
+        # Minimal device nodes: (major, minor)
+        _devs = [
+            ("null",    1, 3,  0o666),
+            ("zero",    1, 5,  0o666),
+            ("full",    1, 7,  0o666),
+            ("random",  1, 8,  0o444),
+            ("urandom", 1, 9,  0o444),
+            ("tty",     5, 0,  0o666),
+            ("console", 5, 1,  0o600),
+        ]
+        for name, major, minor, mode in _devs:
+            path = f"/dev/{name}"
+            dev = os.makedev(major, minor)
+            os.mknod(path, mode | 0o020000, dev)  # S_IFCHR = 0o020000
+        subprocess.run(["mount", "-t", "tmpfs", "tmpfs", "/tmp"], check=True)
+        os.makedirs("/var/luanti/world", exist_ok=True)
+        os.chmod("/var/luanti", 0o777)
+        os.chmod("/var/luanti/world", 0o777)
+
         if network_enabled:
             os.unshare(os.CLONE_NEWNET)
             os.close(w_fd)
             os.read(r_fd, 1)   # block until parent finishes veth setup
             os.close(r_fd)
-            run_command("ip link set lo up")
-            run_command("ip link set veth_container up")
-            run_command("ip addr add 172.18.0.2/24 dev veth_container")
-            run_command("ip route add default via 172.18.0.1")
+            run_command(["ip", "link", "set", "lo", "up"])
+            run_command(["ip", "link", "set", "veth_container", "up"])
+            run_command(["ip", "addr", "add", "172.18.0.2/24", "dev", "veth_container"])
+            run_command(["ip", "route", "add", "default", "via", "172.18.0.1"])
         else:
             os.close(r_fd)
             os.close(w_fd)
 
+        setup_seccomp()
+
+        _libc = ctypes.CDLL(None, use_errno=True)
+        PR_SET_NO_NEW_PRIVS = 38
+        if _libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+            sys.exit("Error: prctl(PR_SET_NO_NEW_PRIVS) failed")
+
+        os.setgroups([])
         os.setgid(65534)
         os.setuid(65534)
-
-        setup_seccomp()
 
         os.environ["HOME"] = "/tmp"
         os.execvp(command_args[0], command_args)
@@ -318,12 +359,25 @@ def run_container(rootfs_path, command_args, memory_limit_mb, cpu_limit_percenta
                 cleanup_networking(cleanup_cmds)
             cleanup_cgroups(pid)
 
+def _port_mapping(value):
+    parts = value.split(":")
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError(f"expected host:container, got {value!r}")
+    for p in parts:
+        try:
+            n = int(p)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"port must be an integer, got {p!r}")
+        if not 1 <= n <= 65535:
+            raise argparse.ArgumentTypeError(f"port {n} out of range [1, 65535]")
+    return value
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Modbox containerization engine.")
     parser.add_argument("--memory-limit", type=int, default=50, help="Memory limit for the container in megabytes (MB).")
     parser.add_argument("--cpu-limit", type=float, default=0.5, help="CPU limit for the container as a percentage (e.g., 0.5 for 50%).")
     parser.add_argument("--pid-limit", type=int, default=32, help="Maximum number of processes allowed in the container.")
-    parser.add_argument("--port", action='append', help="Port mapping (e.g., host_port:container_port). Can be specified multiple times.")
+    parser.add_argument("--port", action='append', type=_port_mapping, help="Port mapping (e.g., host_port:container_port). Can be specified multiple times.")
     parser.add_argument("command", nargs=argparse.REMAINDER, help="Command to execute inside the container")
     return parser.parse_args()
 
