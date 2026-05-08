@@ -49,11 +49,21 @@ def cleanup_cgroups(pid):
     cg_path = f"/sys/fs/cgroup/sandbox_{pid}"
     if not os.path.exists(cg_path):
         return
-    try:
-        with open("/sys/fs/cgroup/cgroup.procs", "w") as f:
-            f.write(str(os.getpid()))
-    except OSError as e:
-        log("warn", f"Could not drain cgroup procs: {e}")
+
+    procs_file = os.path.join(cg_path, "cgroup.procs")
+    if os.path.exists(procs_file):
+        try:
+            with open(procs_file, "r") as f:
+                pids = f.read().split()
+            for p in pids:
+                try:
+                    with open("/sys/fs/cgroup/cgroup.procs", "w") as f_root:
+                        f_root.write(p)
+                except OSError:
+                    pass # PID might have exited in the meantime
+        except OSError as e:
+            log("warn", f"Could not read cgroup procs for cleanup: {e}")
+
     try:
         os.rmdir(cg_path)
         log("cgroup", f"Removed cgroup {cg_path}")
@@ -131,7 +141,7 @@ def cleanup_networking(cleanup_cmds):
         except subprocess.CalledProcessError as e:
             log("warn", f"Cleanup command failed (ignored): {e}")
 
-def setup_seccomp():
+def prepare_seccomp():
     SCMP_ACT_ERRNO_EPERM = 0x00050001
     SCMP_ACT_ALLOW       = 0x7fff0000
 
@@ -157,12 +167,20 @@ def setup_seccomp():
         rc = lib.seccomp_rule_add(ctx, SCMP_ACT_ALLOW, nr, 0)
         if rc != 0:
             log("warn", f"seccomp_rule_add failed for syscall {nr}: {rc}")
+    
+    return lib, ctx
+
+def apply_seccomp(lib, ctx):
+    _libc = ctypes.CDLL(None, use_errno=True)
+    PR_SET_NO_NEW_PRIVS = 38
+    if _libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+        sys.exit("Error: prctl(PR_SET_NO_NEW_PRIVS) failed")
+    log("sec", "PR_SET_NO_NEW_PRIVS set — no privilege escalation via exec")
 
     rc = lib.seccomp_load(ctx)
     if rc != 0:
         sys.exit(f"Error: seccomp filter failed to load: seccomp_load returned {rc}")
     log("sec", f"Seccomp allowlist loaded ({len(ALLOWED_SYSCALLS)} syscalls, default action: EPERM)")
-
     lib.seccomp_release(ctx)
 
 
@@ -182,7 +200,10 @@ def run_container(rootfs_path, command_args, memory_limit_mb, cpu_limit_percenta
             log("net", "Isolating network namespace")
             os.unshare(os.CLONE_NEWNET)
             os.close(w_fd)
-            os.read(r_fd, 1)   # block until parent finishes veth setup
+            signal = os.read(r_fd, 1)
+            if not signal:
+                log("error", "Parent process died or closed pipe before network setup complete")
+                sys.exit(1)
             os.close(r_fd)
             log("net", "Parent signalled veth ready — configuring container side")
             run_command(["ip", "link", "set", "lo", "up"])
@@ -201,6 +222,9 @@ def run_container(rootfs_path, command_args, memory_limit_mb, cpu_limit_percenta
             _, status = os.waitpid(grandchild, 0)
             sys.exit(os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1)
         log("sec", f"Container init started (PID 1 in namespace, host PID {os.getpid()})")
+        log("sec", "Preparing seccomp filter (host libseccomp, before chroot)")
+        seccomp_lib, seccomp_ctx = prepare_seccomp()
+
         log("info", f"Chrooting into {rootfs_path}")
         os.chdir(rootfs_path)
         os.chroot(".")
@@ -223,19 +247,14 @@ def run_container(rootfs_path, command_args, memory_limit_mb, cpu_limit_percenta
         os.chmod("/var/luanti", 0o777)
         os.chmod("/var/luanti/world", 0o777)
 
-        log("sec", "Loading seccomp filter")
-        setup_seccomp()
-
-        _libc = ctypes.CDLL(None, use_errno=True)
-        PR_SET_NO_NEW_PRIVS = 38
-        if _libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
-            sys.exit("Error: prctl(PR_SET_NO_NEW_PRIVS) failed")
-        log("sec", "PR_SET_NO_NEW_PRIVS set — no privilege escalation via exec")
-
         log("sec", "Dropping privileges → UID/GID 65534 (nobody), groups cleared")
         os.setgroups([])
         os.setgid(65534)
         os.setuid(65534)
+
+        log("sec", "Applying seccomp filter")
+        apply_seccomp(seccomp_lib, seccomp_ctx)
+
         log("ok", f"Sandbox ready — launching: {' '.join(command_args)}")
 
         os.environ["HOME"] = "/tmp"

@@ -74,7 +74,7 @@ We will have three main parts:
 ### Prerequisites
 
 ```bash
-sudo apt install iproute2 iptables libseccomp-dev python3
+sudo apt install iproute2 iptables libseccomp-dev python3 curl
 ```
 
 ### First-time setup
