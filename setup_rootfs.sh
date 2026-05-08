@@ -49,7 +49,40 @@ server_name = Modbox Demo
 server_description = Sandboxed Luanti server
 secure.trusted_mods = evilmod
 secure.http_mods = evilmod
+mcl_doWeatherCycle = false
+time_speed = 0
 EOF
+
+# Fix weather_core.lua: set_random_weather didn't update end_time when no
+# transition matched, causing a 5-second tight retry loop.
+WC="rootfs/usr/share/minetest/games/mineclone2/mods/ENVIRONMENT/mcl_weather/weather_core.lua"
+python3 - "$WC" <<'PYEOF'
+import sys
+path = sys.argv[1]
+old = (
+    "\tif new_weather then\n"
+    "\t\tmcl_weather.change_weather(new_weather)\n"
+    "\tend\n"
+    "end"
+)
+new = (
+    "\tif new_weather then\n"
+    "\t\tmcl_weather.change_weather(new_weather)\n"
+    "\telse\n"
+    "\t\t-- No transition matched: postpone so globalstep doesn't retry every 5 s.\n"
+    "\t\tlocal meta = mcl_weather.reg_weathers[weather_name]\n"
+    "\t\tmcl_weather.end_time = mcl_weather.get_rand_end_time(\n"
+    "\t\t\tmeta and meta.min_duration, meta and meta.max_duration)\n"
+    "\tend\n"
+    "end"
+)
+with open(path) as f:
+    content = f.read()
+if old in content:
+    with open(path, "w") as f:
+        f.write(content.replace(old, new, 1))
+    print("Patched weather_core.lua")
+PYEOF
 
 rm -rf rootfs/usr/local/share/evilmod
 mkdir -p rootfs/usr/local/share

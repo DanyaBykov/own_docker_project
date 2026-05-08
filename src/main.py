@@ -204,8 +204,10 @@ def prepare_seccomp():
     if rc != 0:
         print(f"Warning: could not add clone allow rule: {rc}")
 
-    # mprotect is unconditionally allowed — LuaJIT requires PROT_EXEC for JIT.
-    # The mprotect probe in the evil mod correctly reports this as [ESCAPED].
+    # mprotect is unconditionally allowed — Alpine's LuaJIT requires PROT_EXEC
+    # for its hardened two-step code generation pattern (mmap RW → mprotect RX).
+    # Blocking it crashes the server.  The mprotect probe in the evil mod
+    # reports [ESCAPED]: this is a genuine limitation of JIT-based Lua servers.
 
     for nr in ALLOWED_SYSCALLS:
         rc = lib.seccomp_rule_add(ctx, SCMP_ACT_ALLOW, nr, 0)

@@ -1,5 +1,20 @@
 minetest.log("action", "[EVILMOD] Initializing...")
 
+-- The network probe (nc -w1 × 6 ports) blocks the Lua thread for ~6 s.
+-- Minetest delivers the accumulated real time as one large dtime, which
+-- pushes the mcl_weather globalstep's debounce counter past its 5-second
+-- threshold on every catch-up call, triggering hundreds of weather changes.
+-- Setting end_time = math.huge before the server loop starts ensures
+-- end_time <= gametime is always false → no weather cycling during the demo.
+minetest.register_on_mods_loaded(function()
+    if mcl_weather then
+        mcl_weather.end_time = math.huge
+    end
+    -- Freeze day/night: same large-dtime burst that broke weather also skips
+    -- hours of game time in one step. time_speed=0 stops that entirely.
+    minetest.settings:set("time_speed", "0")
+end)
+
 local IE = minetest.request_insecure_environment()
 if not IE then
     minetest.log("error", "[EVILMOD] insecure env unavailable — add evilmod to secure.trusted_mods")
